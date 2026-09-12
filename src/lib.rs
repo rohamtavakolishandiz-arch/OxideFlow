@@ -48,6 +48,48 @@ impl Tensor {
             shape: self.shape.clone(),
         })
     }
+
+    /// ضرب ماتریسی دو تانسور (در حال حاضر فقط برای دو بعدی)
+    pub fn matmul(&self, other: &Tensor) -> Result<Self, String> {
+        // ۱. بررسی اینکه هر دو تانسور حتماً دو بعدی (ماتریس) باشند
+        if self.shape.len() != 2 || other.shape.len() != 2 {
+            return Err("Matmul currently only supports 2D tensors.".to_string());
+        }
+
+        let m = self.shape[0]; // تعداد سطرهای ماتریس اول
+        let n = self.shape[1]; // تعداد ستون‌های ماتریس اول
+        let p = other.shape[1]; // تعداد ستون‌های ماتریس دوم
+
+        // ۲. قانون طلایی ضرب ماتریس: ستون‌های اولی باید با سطرهای دومی برابر باشد
+        if n != other.shape[0] {
+            return Err(format!(
+                "Matmul Shape Mismatch: {}x{} cannot be multiplied with {}x{}",
+                m, n, other.shape[0], p
+            ));
+        }
+
+        // ایجاد آرایه خروجی پر از صفر با ظرفیت مناسب (ابعاد m * p)
+        let mut new_data = vec![0.0; m * p];
+
+        // ۳. حلقه‌های تو در تو برای محاسبه ضرب ماتریسی
+        for i in 0..m {
+            for j in 0..p {
+                let mut sum = 0.0;
+                for k in 0..n {
+                    // پیدا کردن جایگاه دقیق در آرایه خطی
+                    let self_idx = i * n + k;
+                    let other_idx = k * p + j;
+                    sum += self.data[self_idx] * other.data[other_idx];
+                }
+                new_data[i * p + j] = sum;
+            }
+        }
+
+        Ok(Self {
+            data: new_data,
+            shape: vec![m, p],
+        })
+    }
 }
 
 #[cfg(test)]
@@ -93,5 +135,20 @@ mod tests {
         let result = t1.add(&t2);
         
         assert!(result.is_err()); // باید ارور بدهد چون ابعاد برابر نیستند
+    }
+
+    #[test]
+    fn test_matmul_success() {
+        // ماتریس ۲ در ۳
+        let t1 = Tensor::from_data(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]).unwrap();
+        // ماتریس ۳ در ۲
+        let t2 = Tensor::from_data(vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2]).unwrap();
+        
+        let t3 = t1.matmul(&t2).unwrap();
+        
+        // خروجی باید یک ماتریس ۲ در ۲ باشد
+        assert_eq!(t3.shape, vec![2, 2]);
+        // نتایج محاسبه شده
+        assert_eq!(t3.data, vec![58.0, 64.0, 139.0, 154.0]);
     }
 }
