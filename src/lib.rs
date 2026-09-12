@@ -25,6 +25,29 @@ impl Tensor {
         
         Ok(Self { data, shape })
     }
+
+    /// جمع دو تانسور با بررسی یکسان بودن ابعاد
+    pub fn add(&self, other: &Tensor) -> Result<Self, String> {
+        if self.shape != other.shape {
+            return Err(format!(
+                "Shape Mismatch: Cannot add tensors of shape {:?} and {:?}",
+                self.shape, other.shape
+            ));
+        }
+
+        // ایجاد وکتور جدید با ظرفیت از پیش تعیین شده برای سرعت بیشتر
+        let mut new_data = Vec::with_capacity(self.data.len());
+        
+        // پیمایش با یک حلقه ساده و جمع درایه‌های متناظر
+        for i in 0..self.data.len() {
+            new_data.push(self.data[i] + other.data[i]);
+        }
+
+        Ok(Self {
+            data: new_data,
+            shape: self.shape.clone(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -52,5 +75,23 @@ mod tests {
         let shape = vec![2, 2]; // به ۴ داده نیاز دارد
         let tensor = Tensor::from_data(data, shape);
         assert!(tensor.is_err()); // تست موفق است اگر برنامه ارور بدهد
+    }
+
+    #[test]
+    fn test_add_success() {
+        let t1 = Tensor::from_data(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
+        let t2 = Tensor::from_data(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]).unwrap();
+        let t3 = t1.add(&t2).unwrap();
+        
+        assert_eq!(t3.data, vec![6.0, 8.0, 10.0, 12.0]);
+    }
+
+    #[test]
+    fn test_add_mismatch_error() {
+        let t1 = Tensor::zeros(vec![2, 2]); // ۴ داده
+        let t2 = Tensor::zeros(vec![3]);    // ۳ داده
+        let result = t1.add(&t2);
+        
+        assert!(result.is_err()); // باید ارور بدهد چون ابعاد برابر نیستند
     }
 }
