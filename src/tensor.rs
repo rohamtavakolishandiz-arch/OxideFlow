@@ -90,6 +90,31 @@ impl Tensor {
             shape: vec![m, p],
         })
     }
+
+    /// محاسبه ترانهاده ماتریس دو بعدی (جایگزینی سطرها و ستون‌ها)
+    pub fn transpose(&self) -> Result<Self, String> {
+        if self.shape.len() != 2 {
+            return Err("Transpose currently only supports 2D tensors.".to_string());
+        }
+
+        let rows = self.shape[0];
+        let cols = self.shape[1];
+        
+        let mut new_data = vec![0.0; rows * cols];
+
+        for i in 0..rows {
+            for j in 0..cols {
+                let original_idx = i * cols + j;
+                let transposed_idx = j * rows + i;
+                new_data[transposed_idx] = self.data[original_idx];
+            }
+        }
+
+        Ok(Self {
+            data: new_data,
+            shape: vec![cols, rows],
+        })
+    }
 }
 
 use std::fmt;
