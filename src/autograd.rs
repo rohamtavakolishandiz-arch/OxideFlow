@@ -7,6 +7,9 @@ pub enum Op {
     None,
     Add(Variable, Variable),
     Matmul(Variable, Variable),
+    ReLU(Variable),
+    // عملیات جدید: پیش‌بینی شبکه و جواب واقعی
+    MSE(Variable, Variable), 
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +93,47 @@ impl Variable {
                 parent_b._backward();
             }
             Op::None => {}
+            Op::ReLU(parent) => {
+                let parent_data = parent.data.borrow();
+                let mut parent_grad_update = Tensor::zeros(parent_data.shape.clone());
+
+                // برای هر عنصر چک می‌کنیم
+                for i in 0..parent_data.data.len() {
+                    // اگر داده اصلی مثبت بوده، گرادیان از این گره عبور می‌کند (ضرب در ۱)
+                    // اگر منفی بوده، گرادیان صفر می‌شود (ضرب در ۰)
+                    if parent_data.data[i] > 0.0 {
+                        parent_grad_update.data[i] = grad_value.data[i];
+                    } else {
+                        parent_grad_update.data[i] = 0.0;
+                    }
+                }
+
+                Self::update_grad(parent, &parent_grad_update);
+                parent._backward();
+            }
+            Op::MSE(pred, target) => {
+                let p_data = pred.data.borrow();
+                let t_data = target.data.borrow();
+                let n = p_data.data.len() as f64;
+                
+                // گرادیانی که از مراحل بالاتر آمده (برای گره نهایی همیشه ۱.۰ است)
+                let g = grad_value.data[0];
+
+                let mut pred_grad_update = Tensor::zeros(p_data.shape.clone());
+                
+                // اعمال فرمول مشتق: (2/n) * (pred - target) * g
+                for i in 0..p_data.data.len() {
+                    pred_grad_update.data[i] = (2.0 / n) * (p_data.data[i] - t_data.data[i]) * g;
+                }
+
+                // ما فقط گرادیان را به متغیر پیش‌بینی (وزن‌های شبکه ما) برمی‌گردانیم.
+                // جواب‌های واقعی (target) مقادیر ثابتی هستند و نیازی به دریافت گرادیان و آپدیت شدن ندارند.
+                Self::update_grad(pred, &pred_grad_update);
+                
+                pred._backward();
+                // target._backward() فراخوانی می‌شود اما چون از نوع Op::None است اتفاقی نمی‌افتد
+                target._backward();
+            }
         }
     }
 
@@ -98,6 +142,30 @@ impl Variable {
         let mut current_grad = var.grad.borrow_mut();
         let new_grad = current_grad.add(grad_update).unwrap();
         *current_grad = new_grad;
+    }
+
+    /// اعمال تابع ReLU و اتصال به گراف
+    pub fn relu(&self) -> Self {
+        let result_tensor = self.data.borrow().relu();
+        let shape = result_tensor.shape.clone();
+        
+        Self {
+            data: Rc::new(RefCell::new(result_tensor)),
+            grad: Rc::new(RefCell::new(Tensor::zeros(shape))),
+            creator: Rc::new(Op::ReLU(self.clone())), // ذخیره متغیر فعلی به عنوان والد
+        }
+    }
+
+    /// محاسبه خطای MSE و اتصال به گراف
+    pub fn mse_loss(&self, target: &Variable) -> Result<Self, String> {
+        let result_tensor = self.data.borrow().mse_loss(&target.data.borrow())?;
+        
+        Ok(Self {
+            data: Rc::new(RefCell::new(result_tensor)),
+            // گرادیان خطا همیشه در ابتدا [0.0] است
+            grad: Rc::new(RefCell::new(Tensor::zeros(vec![1]))),
+            creator: Rc::new(Op::MSE(self.clone(), target.clone())),
+        })
     }
 }
 
@@ -201,5 +269,50 @@ mod tests {
         assert_eq!(a.grad.borrow().data, vec![4.0, 5.0]);
         // گرادیان b باید برابر با ترانهاده a باشد
         assert_eq!(b.grad.borrow().data, vec![2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_relu_forward_and_backward() {
+        // ۱. ساخت یک متغیر با ترکیبی از اعداد مثبت و منفی
+        let x = Variable::new(Tensor::from_data(vec![-2.0, 0.5, 3.0, -1.0], vec![4]).unwrap());
+        
+        // ۲. اعمال ReLU (مسیر رفت)
+        let y = x.relu();
+        
+        // اعداد منفی باید صفر شده باشند
+        assert_eq!(y.data.borrow().data, vec![0.0, 0.5, 3.0, 0.0]);
+        
+        // ۳. انتشار به عقب
+        y.backward();
+        
+        // ۴. بررسی گرادیان‌ها
+        // چون گرادیان اولیه y کلاً ۱.۰ است، بعد از برگشت به x:
+        // جایی که x منفی بوده -> گرادیان باید صفر شود
+        // جایی که x مثبت بوده -> گرادیان همان ۱.۰ می‌ماند
+        assert_eq!(x.grad.borrow().data, vec![0.0, 1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_mse_loss_backward() {
+        // ۱. پیش‌بینی شبکه ما (مثلاً خروجی یک لایه)
+        let pred = Variable::new(Tensor::from_data(vec![2.0, 4.0], vec![2]).unwrap());
+        
+        // ۲. جواب واقعی که انتظار داشتیم
+        let target = Variable::new(Tensor::from_data(vec![2.0, 2.0], vec![2]).unwrap());
+        
+        // ۳. محاسبه خطا
+        // اختلاف‌ها: (2-2)=0 و (4-2)=2
+        // توان دو: 0 و 4
+        // میانگین: (0 + 4) / 2 = 2.0
+        let loss = pred.mse_loss(&target).unwrap();
+        assert_eq!(loss.data.borrow().data, vec![2.0]);
+        
+        // ۴. انتشار به عقب
+        loss.backward();
+        
+        // ۵. بررسی گرادیان روی pred
+        // مشتق برای عضو اول: (2/2) * (2 - 2) = 0.0
+        // مشتق برای عضو دوم: (2/2) * (4 - 2) = 2.0
+        assert_eq!(pred.grad.borrow().data, vec![0.0, 2.0]);
     }
 }

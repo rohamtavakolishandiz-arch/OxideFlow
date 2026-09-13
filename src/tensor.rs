@@ -116,6 +116,29 @@ impl Tensor {
             shape: self.shape.clone(), // ابعاد تغییری نمی‌کنند
         }
     }
+
+    /// محاسبه تابع زیان میانگین مربعات خطا (MSE)
+    pub fn mse_loss(&self, target: &Tensor) -> Result<Self, String> {
+        if self.shape != target.shape {
+            return Err("Shapes must match for MSE loss.".to_string());
+        }
+
+        let n = self.data.len() as f64;
+        
+        // محاسبه میانگین مربعات اختلاف‌ها
+        let sum_sq: f64 = self
+            .data
+            .iter()
+            .zip(target.data.iter())
+            .map(|(p, t)| (p - t).powi(2))
+            .sum();
+
+        // خروجی یک تانسور اسکالر (تک عضوی) با ابعاد [1] است
+        Ok(Self {
+            data: vec![sum_sq / n],
+            shape: vec![1],
+        })
+    }
 }
 
 // پیاده‌سازی Display برای چاپ خواناتر در ترمینال (اختیاری اما بسیار کاربردی)
