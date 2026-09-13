@@ -2,154 +2,102 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use crate::tensor::Tensor;
 
-/// ذخیره نوع عملیاتی که این متغیر را به وجود آورده است
 #[derive(Clone, Debug)]
 pub enum Op {
-    None, 
+    None,
     Add(Variable, Variable),
-    // عملیات ضرب ماتریسی دو متغیر
     Matmul(Variable, Variable),
 }
 
-/// ساختار Variable برای نگهداری تانسور و گرادیان آن در گراف محاسباتی
 #[derive(Clone, Debug)]
 pub struct Variable {
-    // استفاده از Rc و RefCell برای مدیریت مالکیت اشتراکی و تغییرات داخلی
     pub data: Rc<RefCell<Tensor>>,
     pub grad: Rc<RefCell<Tensor>>,
-    // ذخیره تاریخچه تولد این متغیر
     pub creator: Rc<Op>,
 }
 
 impl Variable {
+    /// سازنده یک متغیر جدید از روی یک تانسور
     pub fn new(tensor: Tensor) -> Self {
-        let grad = Tensor::zeros(tensor.shape.clone());
-        
+        let shape = tensor.shape.clone();
         Self {
             data: Rc::new(RefCell::new(tensor)),
-            grad: Rc::new(RefCell::new(grad)),
-            creator: Rc::new(Op::None), // هیچ والدی ندارد
+            grad: Rc::new(RefCell::new(Tensor::zeros(shape))),
+            creator: Rc::new(Op::None),
         }
     }
 
-    /// جمع دو متغیر و اتصال آن‌ها در گراف محاسباتی
+    /// جمع دو متغیر
     pub fn add(&self, other: &Variable) -> Result<Self, String> {
-        // ۱. دسترسی موقت به تانسورهای خام (فقط-خواندنی)
-        let t1 = self.data.borrow();
-        let t2 = other.data.borrow();
-
-        // ۲. محاسبه حاصل‌جمع با استفاده از متد خام تانسورها
-        let result_tensor = t1.add(&t2)?;
-
-        // ۳. ساخت متغیر جدید و ثبت والدین آن در گراف
-        let result_grad = Tensor::zeros(result_tensor.shape.clone());
-
+        let result_tensor = self.data.borrow().add(&other.data.borrow())?;
+        let shape = result_tensor.shape.clone();
+        
         Ok(Self {
             data: Rc::new(RefCell::new(result_tensor)),
-            grad: Rc::new(RefCell::new(result_grad)),
-            // ۴. اینجا جادوی گراف اتفاق می‌افتد: ذخیره والدین!
+            grad: Rc::new(RefCell::new(Tensor::zeros(shape))),
             creator: Rc::new(Op::Add(self.clone(), other.clone())),
         })
     }
 
-    /// ضرب ماتریسی دو متغیر و اتصال آن‌ها در گراف
+    /// ضرب ماتریسی دو متغیر
     pub fn matmul(&self, other: &Variable) -> Result<Self, String> {
-        let t1 = self.data.borrow();
-        let t2 = other.data.borrow();
-
-        // محاسبه ضرب با استفاده از متد خام تانسورها
-        let result_tensor = t1.matmul(&t2)?;
-        let result_grad = Tensor::zeros(result_tensor.shape.clone());
-
+        let result_tensor = self.data.borrow().matmul(&other.data.borrow())?;
+        let shape = result_tensor.shape.clone();
+        
         Ok(Self {
             data: Rc::new(RefCell::new(result_tensor)),
-            grad: Rc::new(RefCell::new(result_grad)),
-            // ثبت این متغیر به عنوان فرزند حاصل از ضرب
+            grad: Rc::new(RefCell::new(Tensor::zeros(shape))),
             creator: Rc::new(Op::Matmul(self.clone(), other.clone())),
         })
     }
 
-    /// شروع فرآیند انتشار به عقب از این متغیر
-    pub fn backward(&self) {
-        // ۱. وقتی از یک گره، انتشار به عقب را شروع می‌کنیم، گرادیان خودش همیشه ۱ است.
-        // مثلاً مشتق یک متغیر نسبت به خودش برابر یک است.
-        {
-            let mut grad = self.grad.borrow_mut();
-            // تمام درایه‌های ماتریس گرادیان را به ۱ تغییر می‌دهیم
-            for i in 0..grad.data.len() {
-                grad.data[i] = 1.0;
-            }
-        } // قفل RefCell اینجا باز می‌شود
+    /// صفر کردن گرادیان‌ها با استفاده از Iterator (روش استاندارد راست)
+    pub fn zero_grad(&self) {
+        self.grad.borrow_mut().data.iter_mut().for_each(|g| *g = 0.0);
+    }
 
-        // ۲. فراخوانی تابع داخلی برای پخش کردن گرادیان‌ها در کل گراف
+    /// شروع فرآیند انتشار به عقب
+    pub fn backward(&self) {
+        // تنظیم گرادیان اولیه گره خروجی به ۱.۰
+        self.grad.borrow_mut().data.iter_mut().for_each(|g| *g = 1.0);
         self._backward();
     }
 
-    /// تابع داخلی که گراف را به سمت عقب پیمایش می‌کند
-    /// تابع داخلی که گراف را به سمت عقب پیمایش می‌کند
+    /// تابع داخلی پیمایش گراف
     fn _backward(&self) {
-        let grad_value = self.grad.borrow().clone(); // گرادیان این گره چقدر است؟
-        
-        // نگاه می‌کنیم ببینیم این گره چطور متولد شده
+        let grad_value = self.grad.borrow().clone();
+
         match &*self.creator {
             Op::Add(parent_a, parent_b) => {
-                // ... (کدهای قبلی بخش Add که دست نخورده باقی می‌ماند) ...
-                {
-                    let mut a_grad = parent_a.grad.borrow_mut();
-                    let t_grad = a_grad.add(&grad_value).unwrap();
-                    *a_grad = t_grad;
-                }
-                {
-                    let mut b_grad = parent_b.grad.borrow_mut();
-                    let t_grad = b_grad.add(&grad_value).unwrap();
-                    *b_grad = t_grad;
-                }
-                parent_a._backward();
-                parent_b._backward();
-            }
-            
-            // ---> این بخش جدید است که دقیقاً قبل از Op::None اضافه می‌شود <---
-            Op::Matmul(parent_a, parent_b) => {
-                // --- محاسبه گرادیان برای والد اول (A) ---
-                {
-                    let b_data = parent_b.data.borrow();
-                    let b_transposed = b_data.transpose().unwrap(); // B^T
-                    let a_grad_update = grad_value.matmul(&b_transposed).unwrap(); // dC * B^T
-                    
-                    let mut a_grad = parent_a.grad.borrow_mut();
-                    let t_grad = a_grad.add(&a_grad_update).unwrap();
-                    *a_grad = t_grad;
-                }
-                
-                // --- محاسبه گرادیان برای والد دوم (B) ---
-                {
-                    let a_data = parent_a.data.borrow();
-                    let a_transposed = a_data.transpose().unwrap(); // A^T
-                    let b_grad_update = a_transposed.matmul(&grad_value).unwrap(); // A^T * dC
-                    
-                    let mut b_grad = parent_b.grad.borrow_mut();
-                    let t_grad = b_grad.add(&b_grad_update).unwrap();
-                    *b_grad = t_grad;
-                }
-                
-                parent_a._backward();
-                parent_b._backward();
-            }
-            // ---> پایان بخش جدید <---
+                Self::update_grad(parent_a, &grad_value);
+                Self::update_grad(parent_b, &grad_value);
 
-            Op::None => {
-                // این گره والدی ندارد (متغیر پایه است)
+                parent_a._backward();
+                parent_b._backward();
             }
+            Op::Matmul(parent_a, parent_b) => {
+                // محاسبات والد اول (A)
+                let b_transposed = parent_b.data.borrow().transpose().unwrap();
+                let a_grad_update = grad_value.matmul(&b_transposed).unwrap();
+                Self::update_grad(parent_a, &a_grad_update);
+
+                // محاسبات والد دوم (B)
+                let a_transposed = parent_a.data.borrow().transpose().unwrap();
+                let b_grad_update = a_transposed.matmul(&grad_value).unwrap();
+                Self::update_grad(parent_b, &b_grad_update);
+
+                parent_a._backward();
+                parent_b._backward();
+            }
+            Op::None => {}
         }
     }
 
-    /// صفر کردن گرادیان این متغیر (برای استفاده در حلقه‌های آموزش)
-    pub fn zero_grad(&self) {
-        let mut grad = self.grad.borrow_mut();
-        // تمام مقادیر گرادیان را به صفر تغییر می‌دهیم
-        for i in 0..grad.data.len() {
-            grad.data[i] = 0.0;
-        }
+    /// یک تابع کمکی برای تمیز کردن منطق آپدیت گرادیان‌ها
+    fn update_grad(var: &Variable, grad_update: &Tensor) {
+        let mut current_grad = var.grad.borrow_mut();
+        let new_grad = current_grad.add(grad_update).unwrap();
+        *current_grad = new_grad;
     }
 }
 

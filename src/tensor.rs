@@ -1,47 +1,47 @@
-#[derive(Debug, Clone)]
+use std::fmt;
+
+/// ساختار اصلی تانسور برای نگهداری داده‌های خام و ابعاد آن‌ها
+#[derive(Clone, Debug, PartialEq)]
 pub struct Tensor {
-    pub data: Vec<f32>,
+    pub data: Vec<f64>,
     pub shape: Vec<usize>,
 }
 
 impl Tensor {
-    pub fn zeros(shape: Vec<usize>) -> Self {
-        let total_elements: usize = shape.iter().product();
-        let data = vec![0.0; total_elements];
-        Self { data, shape }
-    }
-
-    /// ساخت تانسور از روی داده‌های ورودی با بررسی صحت ابعاد
-    pub fn from_data(data: Vec<f32>, shape: Vec<usize>) -> Result<Self, String> {
-        let expected_length: usize = shape.iter().product();
-        
-        if data.len() != expected_length {
+    /// ساخت یک تانسور جدید از روی داده‌های خام با بررسی صحت ابعاد
+    pub fn from_data(data: Vec<f64>, shape: Vec<usize>) -> Result<Self, String> {
+        let expected_len: usize = shape.iter().product();
+        if data.len() != expected_len {
             return Err(format!(
-                "Dimension Mismatch: Expected {} elements, but got {}",
-                expected_length,
+                "Shape mismatch: expected {} elements, but got {}",
+                expected_len,
                 data.len()
             ));
         }
-        
         Ok(Self { data, shape })
     }
 
-    /// جمع دو تانسور با بررسی یکسان بودن ابعاد
+    /// ساخت یک تانسور پر از صفر (مناسب برای مقداردهی اولیه گرادیان‌ها)
+    pub fn zeros(shape: Vec<usize>) -> Self {
+        let len: usize = shape.iter().product();
+        Self {
+            data: vec![0.0; len],
+            shape,
+        }
+    }
+
+    /// جمع عنصر به عنصر دو تانسور
     pub fn add(&self, other: &Tensor) -> Result<Self, String> {
         if self.shape != other.shape {
-            return Err(format!(
-                "Shape Mismatch: Cannot add tensors of shape {:?} and {:?}",
-                self.shape, other.shape
-            ));
+            return Err("Cannot add tensors of different shapes.".to_string());
         }
 
-        // ایجاد وکتور جدید با ظرفیت از پیش تعیین شده برای سرعت بیشتر
-        let mut new_data = Vec::with_capacity(self.data.len());
-        
-        // پیمایش با یک حلقه ساده و جمع درایه‌های متناظر
-        for i in 0..self.data.len() {
-            new_data.push(self.data[i] + other.data[i]);
-        }
+        let new_data = self
+            .data
+            .iter()
+            .zip(other.data.iter())
+            .map(|(a, b)| a + b)
+            .collect();
 
         Ok(Self {
             data: new_data,
@@ -49,64 +49,51 @@ impl Tensor {
         })
     }
 
-    /// ضرب ماتریسی دو تانسور (در حال حاضر فقط برای دو بعدی)
+    /// ضرب ماتریسی (فقط برای تانسورهای دو بعدی)
     pub fn matmul(&self, other: &Tensor) -> Result<Self, String> {
-        // ۱. بررسی اینکه هر دو تانسور حتماً دو بعدی (ماتریس) باشند
         if self.shape.len() != 2 || other.shape.len() != 2 {
             return Err("Matmul currently only supports 2D tensors.".to_string());
         }
 
-        let m = self.shape[0]; // تعداد سطرهای ماتریس اول
-        let n = self.shape[1]; // تعداد ستون‌های ماتریس اول
-        let p = other.shape[1]; // تعداد ستون‌های ماتریس دوم
+        let (r1, c1) = (self.shape[0], self.shape[1]);
+        let (r2, c2) = (other.shape[0], other.shape[1]);
 
-        // ۲. قانون طلایی ضرب ماتریس: ستون‌های اولی باید با سطرهای دومی برابر باشد
-        if n != other.shape[0] {
+        if c1 != r2 {
             return Err(format!(
-                "Matmul Shape Mismatch: {}x{} cannot be multiplied with {}x{}",
-                m, n, other.shape[0], p
+                "Incompatible shapes for matmul: {:?} x {:?}",
+                self.shape, other.shape
             ));
         }
 
-        // ایجاد آرایه خروجی پر از صفر با ظرفیت مناسب (ابعاد m * p)
-        let mut new_data = vec![0.0; m * p];
-
-        // ۳. حلقه‌های تو در تو برای محاسبه ضرب ماتریسی
-        for i in 0..m {
-            for j in 0..p {
+        let mut new_data = vec![0.0; r1 * c2];
+        for i in 0..r1 {
+            for j in 0..c2 {
                 let mut sum = 0.0;
-                for k in 0..n {
-                    // پیدا کردن جایگاه دقیق در آرایه خطی
-                    let self_idx = i * n + k;
-                    let other_idx = k * p + j;
-                    sum += self.data[self_idx] * other.data[other_idx];
+                for k in 0..c1 {
+                    sum += self.data[i * c1 + k] * other.data[k * c2 + j];
                 }
-                new_data[i * p + j] = sum;
+                new_data[i * c2 + j] = sum;
             }
         }
 
         Ok(Self {
             data: new_data,
-            shape: vec![m, p],
+            shape: vec![r1, c2],
         })
     }
 
-    /// محاسبه ترانهاده ماتریس دو بعدی (جایگزینی سطرها و ستون‌ها)
+    /// محاسبه ترانهاده ماتریس دو بعدی
     pub fn transpose(&self) -> Result<Self, String> {
         if self.shape.len() != 2 {
             return Err("Transpose currently only supports 2D tensors.".to_string());
         }
 
-        let rows = self.shape[0];
-        let cols = self.shape[1];
-        
+        let (rows, cols) = (self.shape[0], self.shape[1]);
         let mut new_data = vec![0.0; rows * cols];
 
         for i in 0..rows {
             for j in 0..cols {
-                let original_idx = i * cols + j;
-                let transposed_idx = j * rows + i;
-                new_data[transposed_idx] = self.data[original_idx];
+                new_data[j * rows + i] = self.data[i * cols + j];
             }
         }
 
@@ -115,39 +102,41 @@ impl Tensor {
             shape: vec![cols, rows],
         })
     }
+
+    /// اعمال تابع فعال‌سازی ReLU به صورت عضو به عضو
+    pub fn relu(&self) -> Self {
+        let new_data = self
+            .data
+            .iter()
+            .map(|&x| if x > 0.0 { x } else { 0.0 }) // اعداد منفی صفر می‌شوند
+            .collect();
+
+        Self {
+            data: new_data,
+            shape: self.shape.clone(), // ابعاد تغییری نمی‌کنند
+        }
+    }
 }
 
-use std::fmt;
-
-// پیاده‌سازی قابلیت چاپ سفارشی برای تانسور
+// پیاده‌سازی Display برای چاپ خواناتر در ترمینال (اختیاری اما بسیار کاربردی)
 impl fmt::Display for Tensor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Tensor(shape: {:?}) [", self.shape)?;
         if self.shape.len() == 2 {
-            let rows = self.shape[0];
             let cols = self.shape[1];
-            writeln!(f, "Tensor {}x{}:", rows, cols)?;
-            
-            for i in 0..rows {
-                write!(f, "[ ")?;
-                for j in 0..cols {
-                    // چاپ اعداد با ۴ رقم اعشار برای زیبایی و دقت
-                    let idx = i * cols + j;
-                    write!(f, "{:.4}  ", self.data[idx])?;
+            for (i, val) in self.data.iter().enumerate() {
+                if i % cols == 0 {
+                    write!(f, "  [")?;
                 }
-                writeln!(f, "]")?;
+                write!(f, "{:.4}, ", val)?;
+                if (i + 1) % cols == 0 {
+                    writeln!(f, "]")?;
+                }
             }
-            Ok(())
-        } else if self.shape.len() == 1 {
-            writeln!(f, "Tensor 1D ({}):", self.shape[0])?;
-            write!(f, "[ ")?;
-            for val in &self.data {
-                write!(f, "{:.4}  ", val)?;
-            }
-            write!(f, "]")
         } else {
-            // برای تانسورهای ۳ بعدی و بالاتر، فعلاً فقط ابعاد را چاپ می‌کنیم
-            write!(f, "Tensor with shape {:?}", self.shape)
+            writeln!(f, "  {:?}", self.data)?;
         }
+        write!(f, "]")
     }
 }
 
