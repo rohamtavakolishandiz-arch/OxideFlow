@@ -1,7 +1,8 @@
 use std::fmt;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
 
-/// ساختار اصلی تانسور برای نگهداری داده‌های خام و ابعاد آن‌ها
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Tensor {
     pub data: Vec<f64>,
     pub shape: Vec<usize>,
@@ -138,6 +139,17 @@ impl Tensor {
             data: vec![sum_sq / n],
             shape: vec![1],
         })
+    }
+    /// ساخت یک تانسور با مقادیر تصادفی (برای مقداردهی اولیه وزن‌ها)
+    pub fn randn(shape: Vec<usize>) -> Self {
+        let mut rng = rand::thread_rng();
+        let len: usize = shape.iter().product();
+        
+        let data: Vec<f64> = (0..len)
+            .map(|_| rng.gen_range(-1.0..1.0))
+            .collect();
+            
+        Self { data, shape }
     }
 }
 

@@ -1,5 +1,8 @@
-use crate::autograd::Variable;
+use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::{Read, Write};
 use crate::tensor::Tensor;
+use crate::autograd::Variable;
 
 /// نمایانگر یک لایه خطی (Fully Connected) در شبکه عصبی
 pub struct Linear {
@@ -7,18 +10,21 @@ pub struct Linear {
     pub bias: Variable,
 }
 
+/// ساختاری ساده برای ذخیره‌سازی وزن و بایاس یک لایه
+#[derive(Serialize, Deserialize)]
+pub struct LayerState {
+    pub weight: Tensor,
+    pub bias: Tensor,
+}
+
 impl Linear {
     /// سازنده لایه جدید با مشخص کردن ابعاد ورودی و خروجی
     pub fn new(in_features: usize, out_features: usize) -> Self {
-        // برای شروع، وزن‌ها را با یک عدد کوچک (مثلاً 0.1) مقداردهی می‌کنیم
-        // در آینده اینجا از اعداد تصادفی (Random) استفاده خواهیم کرد
-        let w_len = in_features * out_features;
-        let w_data = vec![0.1; w_len];
-        let weight = Variable::new(Tensor::from_data(w_data, vec![in_features, out_features]).unwrap());
+        // حالا وزن‌ها با اعداد تصادفی مقداردهی می‌شوند
+        let weight = Variable::new(Tensor::randn(vec![in_features, out_features]));
 
         // بایاس‌ها معمولاً در ابتدا با صفر مقداردهی می‌شوند
-        let b_data = vec![0.0; out_features];
-        let bias = Variable::new(Tensor::from_data(b_data, vec![1, out_features]).unwrap());
+        let bias = Variable::new(Tensor::zeros(vec![1, out_features]));
 
         Self { weight, bias }
     }
@@ -33,5 +39,42 @@ impl Linear {
     /// خروجی دادن تمام پارامترهای لایه برای ارسال به بهینه‌ساز
     pub fn parameters(&self) -> Vec<Variable> {
         vec![self.weight.clone(), self.bias.clone()]
+    }
+
+    /// ذخیره وضعیت لایه روی فایل
+    pub fn save(&self, path: &str) -> Result<(), String> {
+        let state = LayerState {
+            weight: self.weight.data.borrow().clone(),
+            bias: self.bias.data.borrow().clone(),
+        };
+
+        let json = serde_json::to_string_pretty(&state)
+            .map_err(|e| format!("Failed to serialize layer: {}", e))?;
+
+        let mut file = File::create(path)
+            .map_err(|e| format!("Failed to create file: {}", e))?;
+
+        file.write_all(json.as_bytes())
+            .map_err(|e| format!("Failed to write to file: {}", e))?;
+
+        Ok(())
+    }
+
+    /// بارگذاری وضعیت لایه از روی فایل
+    pub fn load(&mut self, path: &str) -> Result<(), String> {
+        let mut file = File::open(path)
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+
+        let mut json = String::new();
+        file.read_to_string(&mut json)
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+
+        let state: LayerState = serde_json::from_str(&json)
+            .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+
+        *self.weight.data.borrow_mut() = state.weight;
+        *self.bias.data.borrow_mut() = state.bias;
+
+        Ok(())
     }
 }
