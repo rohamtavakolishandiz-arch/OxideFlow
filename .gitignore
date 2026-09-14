@@ -1,1 +1,3 @@
 /target
+# Model checkpoints
+*.json
