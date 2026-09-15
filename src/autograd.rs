@@ -8,8 +8,10 @@ pub enum Op {
     Add(Variable, Variable),
     Matmul(Variable, Variable),
     ReLU(Variable),
-    // عملیات جدید: پیش‌بینی شبکه و جواب واقعی
+    Sigmoid(Variable),
+    Tanh(Variable),
     MSE(Variable, Variable), 
+    CrossEntropy(Variable, Variable),
 }
 
 #[derive(Clone, Debug)]
@@ -72,8 +74,16 @@ impl Variable {
 
         match &*self.creator {
             Op::Add(parent_a, parent_b) => {
-                Self::update_grad(parent_a, &grad_value);
-                Self::update_grad(parent_b, &grad_value);
+                // پیدا کردن ابعاد اصلی هر دو والد
+                let shape_a = &parent_a.data.borrow().shape;
+                let shape_b = &parent_b.data.borrow().shape;
+
+                // فشرده‌سازی گرادیان‌ها در صورتی که برادکست شده باشند
+                let grad_a = Self::collapse_grad(&grad_value, shape_a);
+                let grad_b = Self::collapse_grad(&grad_value, shape_b);
+
+                Self::update_grad(parent_a, &grad_a);
+                Self::update_grad(parent_b, &grad_b);
 
                 parent_a._backward();
                 parent_b._backward();
@@ -134,6 +144,58 @@ impl Variable {
                 // target._backward() فراخوانی می‌شود اما چون از نوع Op::None است اتفاقی نمی‌افتد
                 target._backward();
             }
+            Op::CrossEntropy(pred, target) => {
+                let p_data = pred.data.borrow();
+                let t_data = target.data.borrow();
+                let n = p_data.data.len() as f64;
+                let g = grad_value.data[0];
+
+                // محاسبه مجدد Softmax برای پیدا کردن احتمالات
+                let max_val = p_data.max();
+                let shift_data: Vec<f64> = p_data.data.iter().map(|v| v - max_val).collect();
+                let sum_exp: f64 = shift_data.iter().map(|v| v.exp()).sum();
+
+                let mut pred_grad_update = Tensor::zeros(p_data.shape.clone());
+
+                // اعمال فرمول مشتق: (Probabilities - Targets) * (g / n)
+                // تقسیم بر n به خاطر میانگین‌گیری در تابع Loss است
+                for i in 0..p_data.data.len() {
+                    let prob = shift_data[i].exp() / sum_exp;
+                    pred_grad_update.data[i] = (prob - t_data.data[i]) * (g / n);
+                }
+
+                Self::update_grad(pred, &pred_grad_update);
+                
+                pred._backward();
+                target._backward();
+            }
+
+            Op::Sigmoid(parent) => {
+                let out_data = self.data.borrow();
+                let mut parent_grad_update = Tensor::zeros(out_data.shape.clone());
+
+                for i in 0..out_data.data.len() {
+                    let y = out_data.data[i];
+                    let local_grad = y * (1.0 - y);
+                    parent_grad_update.data[i] = grad_value.data[i] * local_grad;
+                }
+
+                Self::update_grad(parent, &parent_grad_update);
+                parent._backward();
+            }
+            Op::Tanh(parent) => {
+                let out_data = self.data.borrow();
+                let mut parent_grad_update = Tensor::zeros(out_data.shape.clone());
+
+                for i in 0..out_data.data.len() {
+                    let y = out_data.data[i];
+                    let local_grad = 1.0 - y * y;
+                    parent_grad_update.data[i] = grad_value.data[i] * local_grad;
+                }
+
+                Self::update_grad(parent, &parent_grad_update);
+                parent._backward();
+            }
         }
     }
 
@@ -167,6 +229,112 @@ impl Variable {
             creator: Rc::new(Op::MSE(self.clone(), target.clone())),
         })
     }
+
+    /// محاسبه Softmax روی خروجی‌های شبکه
+    pub fn softmax(&self) -> Variable {
+        let input_tensor = self.data.borrow();
+        let max_val = input_tensor.max();
+        
+        // e^(x - max) برای جلوگیری از Overflow
+        let shift_data: Vec<f64> = input_tensor.data.iter().map(|v| v - max_val).collect();
+        let shift_tensor = Tensor::from_data(shift_data, input_tensor.shape.clone()).unwrap();
+        let exp_tensor = shift_tensor.exp();
+        let sum_exp = exp_tensor.sum();
+
+        let softmax_data: Vec<f64> = exp_tensor.data.iter().map(|v| v / sum_exp).collect();
+        let output_tensor = Tensor::from_data(softmax_data, input_tensor.shape.clone()).unwrap();
+
+        // ساخت Variable جدید برای گراف محاسباتی
+        Variable::new(output_tensor)
+    }
+
+    /// محاسبه Cross-Entropy Loss
+    /// محاسبه Softmax و Cross-Entropy Loss به صورت ترکیبی و اتصال به گراف
+    pub fn cross_entropy_loss(&self, target: &Variable) -> Result<Variable, String> {
+        let logits = self.data.borrow();
+        let target_bound = target.data.borrow();
+
+        // ۱. محاسبه احتمالات با ثبات عددی
+        let max_val = logits.max();
+        let shift_data: Vec<f64> = logits.data.iter().map(|v| v - max_val).collect();
+        let sum_exp: f64 = shift_data.iter().map(|v| v.exp()).sum();
+
+        let epsilon = 1e-15;
+        let mut loss_sum = 0.0;
+
+        // ۲. محاسبه خطای Cross-Entropy
+        for i in 0..logits.data.len() {
+            let prob = shift_data[i].exp() / sum_exp;
+            let p_clamped = prob.max(epsilon).min(1.0 - epsilon);
+            loss_sum += -target_bound.data[i] * p_clamped.ln();
+        }
+
+        let n = logits.data.len() as f64;
+        let avg_loss = loss_sum / n;
+        let loss_tensor = Tensor::from_data(vec![avg_loss], vec![1])?;
+
+        // ۳. ساخت Variable جدید با ذخیره Op::CrossEntropy به عنوان والد
+        Ok(Self {
+            data: Rc::new(RefCell::new(loss_tensor)),
+            grad: Rc::new(RefCell::new(Tensor::zeros(vec![1]))),
+            creator: Rc::new(Op::CrossEntropy(self.clone(), target.clone())),
+        })
+    }
+
+    /// اعمال تابع فعال‌سازی Sigmoid و اتصال به گراف
+    pub fn sigmoid(&self) -> Self {
+        let result_tensor = self.data.borrow().sigmoid();
+        let shape = result_tensor.shape.clone();
+
+        Self {
+            data: Rc::new(RefCell::new(result_tensor)),
+            grad: Rc::new(RefCell::new(Tensor::zeros(shape))),
+            creator: Rc::new(Op::Sigmoid(self.clone())),
+        }
+    }
+
+    /// اعمال تابع فعال‌سازی Tanh و اتصال به گراف
+    pub fn tanh(&self) -> Self {
+        let result_tensor = self.data.borrow().tanh();
+        let shape = result_tensor.shape.clone();
+
+        Self {
+            data: Rc::new(RefCell::new(result_tensor)),
+            grad: Rc::new(RefCell::new(Tensor::zeros(shape))),
+            creator: Rc::new(Op::Tanh(self.clone())),
+        }
+    }
+
+    /// اگر تانسوری در مسیر رفت Broadcast شده باشد، در مسیر برگشت باید گرادیان‌هایش جمع شوند
+    fn collapse_grad(grad: &Tensor, target_shape: &Vec<usize>) -> Tensor {
+        // ۱. اگر ابعاد یکی است، برادکست اتفاق نیفتاده است
+        if &grad.shape == target_shape {
+            return grad.clone();
+        }
+
+        // ۲. محاسبه جمع گرادیان‌ها برای برادکست [1, N] در یک بچ [B, N]
+        if grad.shape.len() == 2 && target_shape.len() == 2 {
+            let (r, c) = (grad.shape[0], grad.shape[1]);
+            let (tr, tc) = (target_shape[0], target_shape[1]);
+
+            // اگر تارگت فقط یک سطر دارد (بایاس)
+            if tr == 1 && tc == c {
+                let mut new_data = vec![0.0; c];
+                for i in 0..r {
+                    for j in 0..c {
+                        new_data[j] += grad.data[i * c + j];
+                    }
+                }
+                return Tensor {
+                    data: new_data,
+                    shape: target_shape.clone(),
+                };
+            }
+        }
+
+        panic!("Cannot collapse gradient from shape {:?} to {:?}", grad.shape, target_shape);
+    }
+    
 }
 
 #[cfg(test)]
@@ -314,5 +482,33 @@ mod tests {
         // مشتق برای عضو اول: (2/2) * (2 - 2) = 0.0
         // مشتق برای عضو دوم: (2/2) * (4 - 2) = 2.0
         assert_eq!(pred.grad.borrow().data, vec![0.0, 2.0]);
+    }
+
+    #[test]
+    fn test_sigmoid_forward_and_backward() {
+        // x = 0.0 -> Sigmoid(0.0) = 0.5
+        let x = Variable::new(Tensor::from_data(vec![0.0], vec![1]).unwrap());
+        let y = x.sigmoid();
+
+        assert_eq!(y.data.borrow().data, vec![0.5]);
+
+        y.backward();
+
+        // d(sigmoid)/dx at x=0 is 0.5 * (1 - 0.5) = 0.25
+        assert_eq!(x.grad.borrow().data, vec![0.25]);
+    }
+
+    #[test]
+    fn test_tanh_forward_and_backward() {
+        // x = 0.0 -> Tanh(0.0) = 0.0
+        let x = Variable::new(Tensor::from_data(vec![0.0], vec![1]).unwrap());
+        let y = x.tanh();
+
+        assert_eq!(y.data.borrow().data, vec![0.0]);
+
+        y.backward();
+
+        // d(tanh)/dx at x=0 is 1 - 0^2 = 1.0
+        assert_eq!(x.grad.borrow().data, vec![1.0]);
     }
 }

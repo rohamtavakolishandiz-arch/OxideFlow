@@ -32,22 +32,63 @@ impl Tensor {
     }
 
     /// جمع عنصر به عنصر دو تانسور
+    /// جمع دو تانسور با پشتیبانی از Broadcasting برای بایاس‌ها
     pub fn add(&self, other: &Tensor) -> Result<Self, String> {
-        if self.shape != other.shape {
-            return Err("Cannot add tensors of different shapes.".to_string());
+        // 1. Strict Match: If shapes are identical, do standard element-wise addition
+        if self.shape == other.shape {
+            let new_data = self
+                .data
+                .iter()
+                .zip(other.data.iter())
+                .map(|(a, b)| a + b)
+                .collect();
+
+            return Ok(Self {
+                data: new_data,
+                shape: self.shape.clone(),
+            });
         }
 
-        let new_data = self
-            .data
-            .iter()
-            .zip(other.data.iter())
-            .map(|(a, b)| a + b)
-            .collect();
+        // 2. Broadcasting: [B, N] + [1, N] (Self is batch, Other is bias)
+        if self.shape.len() == 2 && other.shape.len() == 2 {
+            let (r1, c1) = (self.shape[0], self.shape[1]);
+            let (r2, c2) = (other.shape[0], other.shape[1]);
 
-        Ok(Self {
-            data: new_data,
-            shape: self.shape.clone(),
-        })
+            // If columns match and the second tensor is just 1 row
+            if c1 == c2 && r2 == 1 {
+                let mut new_data = vec![0.0; r1 * c1];
+                for i in 0..r1 {
+                    for j in 0..c1 {
+                        // Add the bias (other.data[j]) to every row of the batch
+                        new_data[i * c1 + j] = self.data[i * c1 + j] + other.data[j];
+                    }
+                }
+                return Ok(Self {
+                    data: new_data,
+                    shape: self.shape.clone(),
+                });
+            }
+            
+            // Symmetry: [1, N] + [B, N] (Self is bias, Other is batch)
+            if c1 == c2 && r1 == 1 {
+                let mut new_data = vec![0.0; r2 * c2];
+                for i in 0..r2 {
+                    for j in 0..c2 {
+                        new_data[i * c2 + j] = self.data[j] + other.data[i * c2 + j];
+                    }
+                }
+                return Ok(Self {
+                    data: new_data,
+                    shape: other.shape.clone(),
+                });
+            }
+        }
+
+        // 3. Fallback error if shapes are entirely incompatible
+        Err(format!(
+            "Cannot add or broadcast tensors of shapes {:?} and {:?}",
+            self.shape, other.shape
+        ))
     }
 
     /// ضرب ماتریسی (فقط برای تانسورهای دو بعدی)
@@ -151,6 +192,72 @@ impl Tensor {
             
         Self { data, shape }
     }
+
+    /// پیدا کردن بزرگ‌ترین عنصر تانسور (برای پایداری عددی Softmax)
+    pub fn max(&self) -> f64 {
+        self.data.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+    }
+
+    /// محاسبه e به توان تک‌تک عناصر
+    pub fn exp(&self) -> Tensor {
+        let new_data = self.data.iter().map(|v| v.exp()).collect();
+        Tensor {
+            data: new_data,
+            shape: self.shape.clone(),
+        }
+    }
+
+    /// مجموع تمام عناصر تانسور
+    pub fn sum(&self) -> f64 {
+        self.data.iter().sum()
+    }
+
+    /// اعمال تابع فعال‌سازی Sigmoid به صورت عضو به عضو
+    pub fn sigmoid(&self) -> Self {
+        let new_data = self
+            .data
+            .iter()
+            .map(|&x| 1.0 / (1.0 + (-x).exp()))
+            .collect();
+
+        Self {
+            data: new_data,
+            shape: self.shape.clone(),
+        }
+    }
+
+    /// اعمال تابع فعال‌سازی Tanh به صورت عضو به عضو
+    pub fn tanh(&self) -> Self {
+        let new_data = self
+            .data
+            .iter()
+            .map(|&x| x.tanh())
+            .collect();
+
+        Self {
+            data: new_data,
+            shape: self.shape.clone(),
+        }
+    }
+
+    /// ضرب عضو به عضو دو تانسور (بسیار مهم برای محاسبه گرادیان‌ها در backprop)
+    pub fn mul_elementwise(&self, other: &Tensor) -> Result<Self, String> {
+        if self.shape != other.shape {
+            return Err("Cannot multiply tensors of different shapes element-wise.".to_string());
+        }
+
+        let new_data = self
+            .data
+            .iter()
+            .zip(other.data.iter())
+            .map(|(a, b)| a * b)
+            .collect();
+
+        Ok(Self {
+            data: new_data,
+            shape: self.shape.clone(),
+        })
+    }
 }
 
 // پیاده‌سازی Display برای چاپ خواناتر در ترمینال (اختیاری اما بسیار کاربردی)
@@ -240,5 +347,36 @@ mod tests {
         let t = Tensor::from_data(vec![1.1, 2.0, 3.55, 4.0, 5.123, 6.0], vec![2, 3]).unwrap();
         // این دستور تانسور را با فرمت جدیدی که نوشتیم چاپ می‌کند
         println!("{}", t);
+    }
+
+    #[test]
+    fn test_sigmoid() {
+        let t = Tensor::from_data(vec![0.0, 2.0, -2.0], vec![3]).unwrap();
+        let result = t.sigmoid();
+        
+        // Sigmoid(0) = 0.5
+        assert!((result.data[0] - 0.5).abs() < 1e-6);
+        assert!(result.data[1] > 0.88); // Sigmoid(2) ≈ 0.8807
+        assert!(result.data[2] < 0.12); // Sigmoid(-2) ≈ 0.1192
+    }
+
+    #[test]
+    fn test_tanh() {
+        let t = Tensor::from_data(vec![0.0, 1.0, -1.0], vec![3]).unwrap();
+        let result = t.tanh();
+        
+        // Tanh(0) = 0.0
+        assert!((result.data[0] - 0.0).abs() < 1e-6);
+        assert!(result.data[1] > 0.76); // Tanh(1) ≈ 0.7615
+        assert!(result.data[2] < -0.76); // Tanh(-1) ≈ -0.7615
+    }
+
+    #[test]
+    fn test_mul_elementwise() {
+        let t1 = Tensor::from_data(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
+        let t2 = Tensor::from_data(vec![0.5, 2.0, -1.0, 0.0], vec![2, 2]).unwrap();
+        let t3 = t1.mul_elementwise(&t2).unwrap();
+        
+        assert_eq!(t3.data, vec![0.5, 4.0, -3.0, 0.0]);
     }
 }
