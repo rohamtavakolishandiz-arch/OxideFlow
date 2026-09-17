@@ -16,7 +16,7 @@ impl DataLoader {
     }
 
     /// Creates an iterator that yields batches of (Inputs, Targets)
-    pub fn iter(&self) -> DataLoaderIterator {
+    pub fn iter(&self) -> DataLoaderIterator<'_> {
         let mut indices: Vec<usize> = (0..self.inputs.len()).collect();
         
         if self.shuffle {
