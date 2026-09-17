@@ -25,8 +25,9 @@ impl DataLoader {
         }
 
         DataLoaderIterator {
-            inputs: self.inputs.clone(),
-            targets: self.targets.clone(),
+            // 🎯 FIX: Pass references instead of cloning the entire dataset!
+            inputs: &self.inputs,
+            targets: &self.targets,
             indices,
             batch_size: self.batch_size,
             current_idx: 0,
@@ -34,16 +35,16 @@ impl DataLoader {
     }
 }
 
-pub struct DataLoaderIterator {
-    inputs: Vec<Variable>,
-    targets: Vec<Variable>,
+// 🎯 FIX: Introduced lifetime <'a> so the iterator can safely borrow the data
+pub struct DataLoaderIterator<'a> {
+    inputs: &'a [Variable],
+    targets: &'a [Variable],
     indices: Vec<usize>,
     batch_size: usize,
     current_idx: usize,
 }
 
-impl Iterator for DataLoaderIterator {
-    // 🎯 Now yields a single Variable for the entire batch's inputs and targets
+impl<'a> Iterator for DataLoaderIterator<'a> {
     type Item = (Variable, Variable);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -58,17 +59,14 @@ impl Iterator for DataLoaderIterator {
         let mut inputs_data = Vec::new();
         let mut targets_data = Vec::new();
 
-        // Extract and flatten the raw data from the selected indices
         for &i in batch_indices {
             inputs_data.extend_from_slice(&self.inputs[i].data.borrow().data);
             targets_data.extend_from_slice(&self.targets[i].data.borrow().data);
         }
 
-        // Calculate the number of features dynamically
         let input_features = inputs_data.len() / actual_batch_size;
         let target_features = targets_data.len() / actual_batch_size;
 
-        // Construct the single B x N matrix variables
         let batched_input = Variable::new(
             Tensor::from_data(inputs_data, vec![actual_batch_size, input_features]).unwrap()
         );

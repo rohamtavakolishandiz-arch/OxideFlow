@@ -14,6 +14,33 @@ pub trait Module {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct Residual {
+    pub block: Sequential,
+}
+
+impl Residual {
+    pub fn new(layers: Vec<Box<dyn Module>>) -> Self {
+        Self {
+            block: Sequential::new(layers),
+        }
+    }
+}
+
+#[typetag::serde]
+impl Module for Residual {
+    fn forward(&self, input: &Variable) -> Result<Variable, String> {
+        // 1. Pass input through the inner layers: F(x)
+        let fx = self.block.forward(input)?;
+        
+        // 2. Add the original input back to the result: F(x) + x
+        input.add(&fx) 
+    }
+
+    fn parameters(&self) -> Vec<Variable> {
+        self.block.parameters()
+    }
+}
 /// نمایانگر یک لایه خطی
 pub struct Linear {
     pub weight: Variable,
@@ -57,8 +84,20 @@ impl<'de> Deserialize<'de> for Linear {
 
 impl Linear {
     pub fn new(in_features: usize, out_features: usize) -> Self {
-        let weight = Variable::new(Tensor::randn(vec![in_features, out_features]));
+        // 1. Generate standard random weights from a normal distribution
+        let mut weight_tensor = Tensor::randn(vec![in_features, out_features]);
+        
+        // 2. Apply Kaiming (He) scale to stabilize variance across deep layers
+        let kaiming_scale = (2.0 / in_features as f64).sqrt();
+        for val in weight_tensor.data.iter_mut() {
+            *val *= kaiming_scale;
+        }
+
+        let weight = Variable::new(weight_tensor);
+        
+        // 3. Biases safely start at zero
         let bias = Variable::new(Tensor::zeros(vec![1, out_features]));
+        
         Self { weight, bias }
     }
 }
@@ -98,6 +137,15 @@ impl Module for Tanh {
     fn forward(&self, input: &Variable) -> Result<Variable, String> { Ok(input.tanh()) }
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct Softmax;
+
+#[typetag::serde]
+impl Module for Softmax {
+    fn forward(&self, input: &Variable) -> Result<Variable, String> {
+        Ok(input.softmax())
+    }
+}
 // --- کانتینر ترتیبی ---
 
 #[derive(Serialize, Deserialize)]
@@ -124,8 +172,28 @@ impl Sequential {
         let mut file = File::open(path).map_err(|e| format!("File Error: {}", e))?;
         let mut json = String::new();
         file.read_to_string(&mut json).map_err(|e| format!("Read Error: {}", e))?;
-        let model: Sequential = serde_json::from_str(&json)
-            .map_err(|e| format!("Parse Error: {}", e))?;
+        let model = Sequential::new(vec![
+            // 1. Projection layer (2D input -> 64D feature space)
+            Box::new(Linear::new(2, 64)),
+            Box::new(ReLU),
+        
+            // 2. Deep Residual Blocks (preserves gradient flow across deep layers)
+            Box::new(Residual::new(vec![
+                Box::new(Linear::new(64, 64)),
+                Box::new(ReLU),
+                Box::new(Linear::new(64, 64)),
+                Box::new(ReLU),
+            ])),
+            Box::new(Residual::new(vec![
+                Box::new(Linear::new(64, 64)),
+                Box::new(ReLU),
+                Box::new(Linear::new(64, 64)),
+                Box::new(ReLU),
+            ])),
+        
+            // 3. Classification Head (64D -> 2 output classes)
+            Box::new(Linear::new(64, 2)),
+        ]);
         Ok(model)
     }
 }
