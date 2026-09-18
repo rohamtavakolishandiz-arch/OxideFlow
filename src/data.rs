@@ -15,7 +15,6 @@ impl DataLoader {
         Self { inputs, targets, batch_size, shuffle }
     }
 
-    /// Creates an iterator that yields batches of (Inputs, Targets)
     pub fn iter(&self) -> DataLoaderIterator<'_> {
         let mut indices: Vec<usize> = (0..self.inputs.len()).collect();
         
@@ -25,7 +24,6 @@ impl DataLoader {
         }
 
         DataLoaderIterator {
-            // 🎯 FIX: Pass references instead of cloning the entire dataset!
             inputs: &self.inputs,
             targets: &self.targets,
             indices,
@@ -35,7 +33,6 @@ impl DataLoader {
     }
 }
 
-// 🎯 FIX: Introduced lifetime <'a> so the iterator can safely borrow the data
 pub struct DataLoaderIterator<'a> {
     inputs: &'a [Variable],
     targets: &'a [Variable],
@@ -48,9 +45,7 @@ impl<'a> Iterator for DataLoaderIterator<'a> {
     type Item = (Variable, Variable);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current_idx >= self.indices.len() {
-            return None;
-        }
+        if self.current_idx >= self.indices.len() { return None; }
 
         let end_idx = std::cmp::min(self.current_idx + self.batch_size, self.indices.len());
         let batch_indices = &self.indices[self.current_idx..end_idx];
@@ -64,15 +59,15 @@ impl<'a> Iterator for DataLoaderIterator<'a> {
             targets_data.extend_from_slice(&self.targets[i].data.borrow().data);
         }
 
-        let input_features = inputs_data.len() / actual_batch_size;
-        let target_features = targets_data.len() / actual_batch_size;
+        // 🎯 UPGRADE: Dynamically inherit the true N-dimensional shape of the data!
+        let mut input_shape = self.inputs[batch_indices[0]].data.borrow().shape.clone();
+        input_shape[0] = actual_batch_size; 
 
-        let batched_input = Variable::new(
-            Tensor::from_data(inputs_data, vec![actual_batch_size, input_features]).unwrap()
-        );
-        let batched_target = Variable::new(
-            Tensor::from_data(targets_data, vec![actual_batch_size, target_features]).unwrap()
-        );
+        let mut target_shape = self.targets[batch_indices[0]].data.borrow().shape.clone();
+        target_shape[0] = actual_batch_size;
+
+        let batched_input = Variable::new(Tensor::from_data(inputs_data, input_shape).unwrap());
+        let batched_target = Variable::new(Tensor::from_data(targets_data, target_shape).unwrap());
 
         self.current_idx = end_idx;
         Some((batched_input, batched_target))

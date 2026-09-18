@@ -1,7 +1,8 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::collections::HashSet;
 use crate::tensor::Tensor;
+use rand::Rng;
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::rc::Rc;
 
 #[derive(Clone, Debug)]
 pub enum Op {
@@ -11,9 +12,13 @@ pub enum Op {
     ReLU(Variable),
     Sigmoid(Variable),
     Tanh(Variable),
-    MSE(Variable, Variable), 
+    MSE(Variable, Variable),
     CrossEntropy(Variable, Variable),
     Softmax(Variable),
+    Dropout(Variable, Tensor), // 🎯 Tracks the parent and the dropout mask
+    Reshape(Variable, Vec<usize>),
+    Conv2d(Variable, Variable, Variable, usize, usize),
+    MaxPool2d(Variable, usize),
 }
 
 #[derive(Clone, Debug)]
@@ -24,7 +29,6 @@ pub struct Variable {
 }
 
 impl Variable {
-
     pub fn new(tensor: Tensor) -> Self {
         let shape = tensor.shape.clone();
         Self {
@@ -60,7 +64,11 @@ impl Variable {
     }
 
     pub fn zero_grad(&self) {
-        self.grad.borrow_mut().data.iter_mut().for_each(|g| *g = 0.0);
+        self.grad
+            .borrow_mut()
+            .data
+            .iter_mut()
+            .for_each(|g| *g = 0.0);
     }
 
     /// 🎯 Topologically sorted backward pass (PyTorch standard)
@@ -76,11 +84,25 @@ impl Variable {
                     Op::Add(a, b) | Op::Matmul(a, b) | Op::MSE(a, b) | Op::CrossEntropy(a, b) => {
                         build_topo(a, topo, visited);
                         build_topo(b, topo, visited);
-                    },
-                    // 🎯 FIX: Added Softmax to the topological sort
-                    Op::ReLU(a) | Op::Sigmoid(a) | Op::Tanh(a) | Op::Softmax(a) => {
+                    }
+                    // 🎯 FIX: Added Dropout here so the graph knows how to traverse it!
+                    // Update this line inside build_topo:
+                    Op::ReLU(a)
+                    | Op::Sigmoid(a)
+                    | Op::Tanh(a)
+                    | Op::Softmax(a)
+                    | Op::Dropout(a, _)
+                    | Op::Reshape(a, _)
+                    | Op::MaxPool2d(a, _) => {
                         build_topo(a, topo, visited);
-                    },
+                    }
+
+                    Op::Conv2d(a, b, c, _, _) => {
+                        build_topo(a, topo, visited);
+                        build_topo(b, topo, visited);
+                        build_topo(c, topo, visited);
+                    }
+
                     Op::None => {}
                 }
                 topo.push(v.clone());
@@ -89,7 +111,11 @@ impl Variable {
 
         build_topo(self, &mut topo, &mut visited);
 
-        self.grad.borrow_mut().data.iter_mut().for_each(|g| *g = 1.0);
+        self.grad
+            .borrow_mut()
+            .data
+            .iter_mut()
+            .for_each(|g| *g = 1.0);
 
         for v in topo.into_iter().rev() {
             v._backward_step();
@@ -156,7 +182,9 @@ impl Variable {
                     let mut max_val = f64::NEG_INFINITY;
                     for j in 0..num_classes {
                         let val = p_data.data[i * num_classes + j];
-                        if val > max_val { max_val = val; }
+                        if val > max_val {
+                            max_val = val;
+                        }
                     }
 
                     let mut sum_exp = 0.0;
@@ -167,7 +195,8 @@ impl Variable {
                     for j in 0..num_classes {
                         let idx = i * num_classes + j;
                         let prob = (p_data.data[idx] - max_val).exp() / sum_exp;
-                        pred_grad_update.data[idx] = (prob - t_data.data[idx]) * (g / batch_size as f64);
+                        pred_grad_update.data[idx] =
+                            (prob - t_data.data[idx]) * (g / batch_size as f64);
                     }
                 }
                 Self::update_grad(pred, &pred_grad_update);
@@ -190,7 +219,6 @@ impl Variable {
                 }
                 Self::update_grad(parent, &parent_grad_update);
             }
-
             Op::Softmax(parent) => {
                 let out_data = self.data.borrow();
                 let mut parent_grad = Tensor::zeros(out_data.shape.clone());
@@ -203,7 +231,7 @@ impl Variable {
                         let idx = i * num_classes + k;
                         dot_product += grad_value.data[idx] * out_data.data[idx];
                     }
-                    
+
                     for j in 0..num_classes {
                         let idx = i * num_classes + j;
                         let y_j = out_data.data[idx];
@@ -213,6 +241,40 @@ impl Variable {
                 }
                 Self::update_grad(parent, &parent_grad);
             }
+
+            // 🎯 FIX: Dropout backward logic cleaned up and isolated correctly
+            Op::Dropout(parent, mask) => {
+                let mut parent_grad = Tensor::zeros(mask.shape.clone());
+                for i in 0..mask.data.len() {
+                    // Only flow gradients back through nodes that were KEPT (mask > 0)
+                    parent_grad.data[i] = grad_value.data[i] * mask.data[i];
+                }
+                Self::update_grad(parent, &parent_grad);
+            }
+
+            // Add this route to your match block inside _backward_step:
+            Op::Reshape(parent, original_shape) => {
+                let reshaped_grad = grad_value.reshape(original_shape.clone()).unwrap();
+                Self::update_grad(parent, &reshaped_grad);
+            }
+
+            Op::Conv2d(input, weight, bias, stride, padding) => {
+                let (grad_in, grad_w, grad_b) = input.data.borrow().conv2d_backward(
+                    &grad_value,
+                    &weight.data.borrow(),
+                    *stride,
+                    *padding,
+                );
+                Self::update_grad(input, &grad_in);
+                Self::update_grad(weight, &grad_w);
+                Self::update_grad(bias, &grad_b);
+            }
+
+            Op::MaxPool2d(parent, kernel_size) => {
+                let parent_grad = parent.data.borrow().maxpool2d_backward(&grad_value, *kernel_size);
+                Self::update_grad(parent, &parent_grad);
+            }
+
             Op::None => {}
         }
     }
@@ -266,7 +328,9 @@ impl Variable {
             let mut max_val = f64::NEG_INFINITY;
             for j in 0..num_classes {
                 let val = logits.data[i * num_classes + j];
-                if val > max_val { max_val = val; }
+                if val > max_val {
+                    max_val = val;
+                }
             }
             let mut sum_exp = 0.0;
             for j in 0..num_classes {
@@ -329,8 +393,93 @@ impl Variable {
                 };
             }
         }
-        panic!("Cannot collapse gradient from shape {:?} to {:?}", grad.shape, target_shape);
+        panic!(
+            "Cannot collapse gradient from shape {:?} to {:?}",
+            grad.shape, target_shape
+        );
     }
 
+    pub fn dropout(&self, p: f64) -> Self {
+        let mut rng = rand::thread_rng();
+        let scale = 1.0 / (1.0 - p); // Scale up surviving nodes to maintain expected sum
+        let in_tensor = self.data.borrow();
+
+        let mut out_data = Vec::with_capacity(in_tensor.data.len());
+        let mut mask_data = Vec::with_capacity(in_tensor.data.len());
+
+        for &val in &in_tensor.data {
+            if rng.gen_range(0.0..1.0) >= p {
+                out_data.push(val * scale);
+                mask_data.push(scale);
+            } else {
+                out_data.push(0.0);
+                mask_data.push(0.0);
+            }
+        }
+
+        let out_tensor = Tensor {
+            data: out_data,
+            shape: in_tensor.shape.clone(),
+        };
+        let mask_tensor = Tensor {
+            data: mask_data,
+            shape: in_tensor.shape.clone(),
+        };
+
+        Self {
+            data: Rc::new(RefCell::new(out_tensor)),
+            grad: Rc::new(RefCell::new(Tensor::zeros(in_tensor.shape.clone()))),
+            creator: Rc::new(Op::Dropout(self.clone(), mask_tensor)),
+        }
+    }
+
+    pub fn reshape(&self, new_shape: Vec<usize>) -> Self {
+        let original_shape = self.data.borrow().shape.clone();
+        let reshaped_tensor = self.data.borrow().reshape(new_shape).unwrap();
+        let current_shape = reshaped_tensor.shape.clone();
+
+        Self {
+            data: Rc::new(RefCell::new(reshaped_tensor)),
+            grad: Rc::new(RefCell::new(Tensor::zeros(current_shape))),
+            creator: Rc::new(Op::Reshape(self.clone(), original_shape)),
+        }
+    }
+
+    pub fn conv2d(
+        &self,
+        weight: &Variable,
+        bias: &Variable,
+        stride: usize,
+        padding: usize,
+    ) -> Result<Self, String> {
+        let result = self.data.borrow().conv2d(
+            &weight.data.borrow(),
+            &bias.data.borrow(),
+            stride,
+            padding,
+        )?;
+        let shape = result.shape.clone();
+        Ok(Self {
+            data: Rc::new(RefCell::new(result)),
+            grad: Rc::new(RefCell::new(Tensor::zeros(shape))),
+            creator: Rc::new(Op::Conv2d(
+                self.clone(),
+                weight.clone(),
+                bias.clone(),
+                stride,
+                padding,
+            )),
+        })
+    }
+
+    pub fn maxpool2d(&self, kernel_size: usize) -> Result<Self, String> {
+        let result = self.data.borrow().maxpool2d(kernel_size)?;
+        let shape = result.shape.clone();
+        Ok(Self {
+            data: Rc::new(RefCell::new(result)),
+            grad: Rc::new(RefCell::new(Tensor::zeros(shape))),
+            creator: Rc::new(Op::MaxPool2d(self.clone(), kernel_size)),
+        })
+    }
     
 }

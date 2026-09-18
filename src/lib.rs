@@ -3,3 +3,5 @@ pub mod autograd;
 pub mod optimizer;
 pub mod nn;
 pub mod data;
+pub mod mnist;
+pub mod cifar;
