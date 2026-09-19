@@ -1,21 +1,22 @@
 use crate::autograd::Variable;
+use crate::tensor::Tensor;
+use crate::backend::Backend;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use crate::tensor::Tensor;
 
-pub struct DataLoader {
-    inputs: Vec<Variable>,
-    targets: Vec<Variable>,
+pub struct DataLoader<B: Backend> {
+    inputs: Vec<Variable<B>>,
+    targets: Vec<Variable<B>>,
     batch_size: usize,
     shuffle: bool,
 }
 
-impl DataLoader {
-    pub fn new(inputs: Vec<Variable>, targets: Vec<Variable>, batch_size: usize, shuffle: bool) -> Self {
+impl<B: Backend> DataLoader<B> {
+    pub fn new(inputs: Vec<Variable<B>>, targets: Vec<Variable<B>>, batch_size: usize, shuffle: bool) -> Self {
         Self { inputs, targets, batch_size, shuffle }
     }
 
-    pub fn iter(&self) -> DataLoaderIterator<'_> {
+    pub fn iter(&self) -> DataLoaderIterator<'_, B> {
         let mut indices: Vec<usize> = (0..self.inputs.len()).collect();
         
         if self.shuffle {
@@ -33,16 +34,16 @@ impl DataLoader {
     }
 }
 
-pub struct DataLoaderIterator<'a> {
-    inputs: &'a [Variable],
-    targets: &'a [Variable],
+pub struct DataLoaderIterator<'a, B: Backend> {
+    inputs: &'a [Variable<B>],
+    targets: &'a [Variable<B>],
     indices: Vec<usize>,
     batch_size: usize,
     current_idx: usize,
 }
 
-impl<'a> Iterator for DataLoaderIterator<'a> {
-    type Item = (Variable, Variable);
+impl<'a, B: Backend> Iterator for DataLoaderIterator<'a, B> {
+    type Item = (Variable<B>, Variable<B>);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current_idx >= self.indices.len() { return None; }
@@ -54,20 +55,27 @@ impl<'a> Iterator for DataLoaderIterator<'a> {
         let mut inputs_data = Vec::new();
         let mut targets_data = Vec::new();
 
+        // 🎯 Dynamically extract the device from the first tensor in the batch
+        let device = self.inputs[batch_indices[0]].data.borrow().device.clone();
+
         for &i in batch_indices {
-            inputs_data.extend_from_slice(&self.inputs[i].data.borrow().data);
-            targets_data.extend_from_slice(&self.targets[i].data.borrow().data);
+            // Safely extract opaque hardware memory to CPU to stitch the batch together
+            let cpu_in = B::to_cpu(&device, &self.inputs[i].data.borrow().data);
+            let cpu_tg = B::to_cpu(&device, &self.targets[i].data.borrow().data);
+            
+            inputs_data.extend(cpu_in);
+            targets_data.extend(cpu_tg);
         }
 
-        // 🎯 UPGRADE: Dynamically inherit the true N-dimensional shape of the data!
         let mut input_shape = self.inputs[batch_indices[0]].data.borrow().shape.clone();
         input_shape[0] = actual_batch_size; 
 
         let mut target_shape = self.targets[batch_indices[0]].data.borrow().shape.clone();
         target_shape[0] = actual_batch_size;
 
-        let batched_input = Variable::new(Tensor::from_data(inputs_data, input_shape).unwrap());
-        let batched_target = Variable::new(Tensor::from_data(targets_data, target_shape).unwrap());
+        // Push the fully assembled batch back to the target device
+        let batched_input = Variable::new(Tensor::from_data(device.clone(), inputs_data, input_shape).unwrap());
+        let batched_target = Variable::new(Tensor::from_data(device, targets_data, target_shape).unwrap());
 
         self.current_idx = end_idx;
         Some((batched_input, batched_target))

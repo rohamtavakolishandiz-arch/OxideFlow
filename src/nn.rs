@@ -1,144 +1,30 @@
+// src/nn.rs
 use crate::autograd::Variable;
 use crate::tensor::Tensor;
-use serde::{Deserialize, Serialize, Deserializer, Serializer};
-use std::fs::File;
-use std::io::{Read, Write};
+use crate::backend::Backend;
+use rand::Rng;
 
-#[typetag::serde(tag = "type")]
-pub trait Module {
-    // 🎯 UPGRADED: Added is_training flag to context-switch behaviors
-    fn forward(&self, input: &Variable, is_training: bool) -> Result<Variable, String>;
-    
-    fn parameters(&self) -> Vec<Variable> { vec![] }
-}
-
-// 🎯 NEW: Flattens N-Dimensional tensors into 2D [Batch, Features]
-#[derive(Serialize, Deserialize)]
-pub struct Flatten;
-
-#[typetag::serde]
-impl Module for Flatten {
-    fn forward(&self, input: &Variable, _is_training: bool) -> Result<Variable, String> {
-        let in_shape = &input.data.borrow().shape;
-        
-        if in_shape.len() < 2 {
-            return Err("Cannot flatten a tensor with less than 2 dimensions".to_string());
-        }
-
-        let batch_size = in_shape[0];
-        // Multiply the rest of the dimensions together (e.g., 1 * 28 * 28 = 784)
-        let flat_features: usize = in_shape[1..].iter().product(); 
-        
-        Ok(input.reshape(vec![batch_size, flat_features]))
-    }
-}
-
-pub struct Conv2d {
-    pub weight: Variable,
-    pub bias: Variable,
-    pub stride: usize,
-    pub padding: usize,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Conv2dState {
-    weight: Tensor,
-    bias: Tensor,
-    stride: usize,
-    padding: usize,
-}
-
-impl Serialize for Conv2d {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: Serializer {
-        let state = Conv2dState {
-            weight: self.weight.data.borrow().clone(),
-            bias: self.bias.data.borrow().clone(),
-            stride: self.stride,
-            padding: self.padding,
-        };
-        state.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for Conv2d {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error> where D: Deserializer<'de> {
-        let state = Conv2dState::deserialize(deserializer)?;
-        Ok(Conv2d {
-            weight: Variable::new(state.weight),
-            bias: Variable::new(state.bias),
-            stride: state.stride,
-            padding: state.padding,
-        })
-    }
-}
-
-impl Conv2d {
-    pub fn new(in_channels: usize, out_channels: usize, kernel_size: usize, stride: usize, padding: usize) -> Self {
-        let mut weight_tensor = Tensor::randn(vec![out_channels, in_channels, kernel_size, kernel_size]);
-        
-        // 4D Kaiming Initialization for spatial filters
-        let fan_in = in_channels * kernel_size * kernel_size; 
-        let kaiming_scale = (2.0 / fan_in as f64).sqrt();
-        for val in weight_tensor.data.iter_mut() { *val *= kaiming_scale; }
-        
-        Self {
-            weight: Variable::new(weight_tensor),
-            bias: Variable::new(Tensor::zeros(vec![out_channels])),
-            stride,
-            padding,
-        }
-    }
-}
-
-#[typetag::serde]
-impl Module for Conv2d {
-    fn forward(&self, input: &Variable, _is_training: bool) -> Result<Variable, String> {
-        input.conv2d(&self.weight, &self.bias, self.stride, self.padding)
-    }
-    fn parameters(&self) -> Vec<Variable> { vec![self.weight.clone(), self.bias.clone()] }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct MaxPool2d {
-    pub kernel_size: usize,
-}
-
-#[typetag::serde]
-impl Module for MaxPool2d {
-    fn forward(&self, input: &Variable, _is_training: bool) -> Result<Variable, String> {
-        input.maxpool2d(self.kernel_size)
-    }
+pub trait Module<B: Backend> {
+    fn forward(&self, input: &Variable<B>, is_training: bool) -> Result<Variable<B>, String>;
+    fn parameters(&self) -> Vec<Variable<B>> { vec![] }
 }
 
 // ==========================================
 // Blocks & Containers
 // ==========================================
 
-#[derive(Serialize, Deserialize)]
-pub struct Sequential { pub layers: Vec<Box<dyn Module>> }
+pub struct Sequential<B: Backend> { 
+    pub layers: Vec<Box<dyn Module<B>>> 
+}
 
-impl Sequential {
-    pub fn new(layers: Vec<Box<dyn Module>>) -> Self { Self { layers } }
-
-    pub fn save(&self, path: &str) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        let mut file = File::create(path).map_err(|e| e.to_string())?;
-        file.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    pub fn load(path: &str) -> Result<Self, String> {
-        let mut file = File::open(path).map_err(|e| e.to_string())?;
-        let mut json = String::new();
-        file.read_to_string(&mut json).map_err(|e| e.to_string())?;
-        let model: Sequential = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-        Ok(model)
+impl<B: Backend> Sequential<B> {
+    pub fn new(layers: Vec<Box<dyn Module<B>>>) -> Self { 
+        Self { layers } 
     }
 }
 
-#[typetag::serde]
-impl Module for Sequential {
-    fn forward(&self, input: &Variable, is_training: bool) -> Result<Variable, String> {
+impl<B: Backend> Module<B> for Sequential<B> {
+    fn forward(&self, input: &Variable<B>, is_training: bool) -> Result<Variable<B>, String> {
         let mut current = input.clone();
         for layer in &self.layers {
             current = layer.forward(&current, is_training)?;
@@ -146,123 +32,173 @@ impl Module for Sequential {
         Ok(current)
     }
 
-    fn parameters(&self) -> Vec<Variable> {
+    fn parameters(&self) -> Vec<Variable<B>> {
         self.layers.iter().flat_map(|l| l.parameters()).collect()
     }
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct Residual { pub block: Sequential }
+pub struct Residual<B: Backend> { 
+    pub block: Sequential<B> 
+}
 
-impl Residual {
-    pub fn new(layers: Vec<Box<dyn Module>>) -> Self {
+impl<B: Backend> Residual<B> {
+    pub fn new(layers: Vec<Box<dyn Module<B>>>) -> Self {
         Self { block: Sequential::new(layers) }
     }
 }
 
-#[typetag::serde]
-impl Module for Residual {
-    fn forward(&self, input: &Variable, is_training: bool) -> Result<Variable, String> {
+impl<B: Backend> Module<B> for Residual<B> {
+    fn forward(&self, input: &Variable<B>, is_training: bool) -> Result<Variable<B>, String> {
         let fx = self.block.forward(input, is_training)?;
         input.add(&fx) 
     }
-    fn parameters(&self) -> Vec<Variable> { self.block.parameters() }
-}
-
-// ==========================================
-// Layers & Activations
-// ==========================================
-
-pub struct Linear {
-    pub weight: Variable,
-    pub bias: Variable,
-}
-
-#[derive(Serialize, Deserialize)]
-struct LayerState {
-    weight: Tensor,
-    bias: Tensor,
-}
-
-impl Serialize for Linear {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: Serializer {
-        let state = LayerState {
-            weight: self.weight.data.borrow().clone(),
-            bias: self.bias.data.borrow().clone(),
-        };
-        state.serialize(serializer)
+    
+    fn parameters(&self) -> Vec<Variable<B>> { 
+        self.block.parameters() 
     }
 }
 
-impl<'de> Deserialize<'de> for Linear {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error> where D: Deserializer<'de> {
-        let state = LayerState::deserialize(deserializer)?;
-        Ok(Linear {
-            weight: Variable::new(state.weight),
-            bias: Variable::new(state.bias),
-        })
-    }
+// ==========================================
+// Layers with Parameters
+// ==========================================
+
+pub struct Conv2d<B: Backend> {
+    pub weight: Variable<B>,
+    pub bias: Variable<B>,
+    pub stride: usize,
+    pub padding: usize,
 }
 
-impl Linear {
-    pub fn new(in_features: usize, out_features: usize) -> Self {
-        let mut weight_tensor = Tensor::randn(vec![in_features, out_features]);
-        let kaiming_scale = (2.0 / in_features as f64).sqrt();
-        for val in weight_tensor.data.iter_mut() { *val *= kaiming_scale; }
+impl<B: Backend> Conv2d<B> {
+    pub fn new(device: B, in_channels: usize, out_channels: usize, kernel_size: usize, stride: usize, padding: usize) -> Self {
+        let len = out_channels * in_channels * kernel_size * kernel_size;
+        let fan_in = in_channels * kernel_size * kernel_size; 
+        let kaiming_scale = (2.0 / fan_in as f64).sqrt();
+        
+        // 🎯 Kaiming Init on CPU before allocating to the Backend
+        let mut rng = rand::thread_rng();
+        let mut data = Vec::with_capacity(len);
+        for _ in 0..len {
+            let u1: f64 = rng.gen_range(1e-10..1.0);
+            let u2: f64 = rng.gen_range(0.0..1.0);
+            let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            data.push(z0 * kaiming_scale);
+        }
+        
+        let weight_tensor = Tensor::from_data(device.clone(), data, vec![out_channels, in_channels, kernel_size, kernel_size]).unwrap();
+        let bias_tensor = Tensor::zeros(device.clone(), vec![out_channels]);
+        
         Self {
             weight: Variable::new(weight_tensor),
-            bias: Variable::new(Tensor::zeros(vec![1, out_features])),
+            bias: Variable::new(bias_tensor),
+            stride,
+            padding,
         }
     }
 }
 
-#[typetag::serde]
-impl Module for Linear {
-    fn forward(&self, input: &Variable, _is_training: bool) -> Result<Variable, String> {
+impl<B: Backend> Module<B> for Conv2d<B> {
+    fn forward(&self, input: &Variable<B>, _is_training: bool) -> Result<Variable<B>, String> {
+        input.conv2d(&self.weight, &self.bias, self.stride, self.padding)
+    }
+    fn parameters(&self) -> Vec<Variable<B>> { vec![self.weight.clone(), self.bias.clone()] }
+}
+
+pub struct Linear<B: Backend> {
+    pub weight: Variable<B>,
+    pub bias: Variable<B>,
+}
+
+impl<B: Backend> Linear<B> {
+    pub fn new(device: B, in_features: usize, out_features: usize) -> Self {
+        let len = in_features * out_features;
+        let kaiming_scale = (2.0 / in_features as f64).sqrt();
+        
+        // 🎯 Kaiming Init on CPU before allocating to the Backend
+        let mut rng = rand::thread_rng();
+        let mut data = Vec::with_capacity(len);
+        for _ in 0..len {
+            let u1: f64 = rng.gen_range(1e-10..1.0);
+            let u2: f64 = rng.gen_range(0.0..1.0);
+            let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            data.push(z0 * kaiming_scale);
+        }
+        
+        let weight_tensor = Tensor::from_data(device.clone(), data, vec![in_features, out_features]).unwrap();
+        let bias_tensor = Tensor::zeros(device.clone(), vec![1, out_features]);
+        
+        Self {
+            weight: Variable::new(weight_tensor),
+            bias: Variable::new(bias_tensor),
+        }
+    }
+}
+
+impl<B: Backend> Module<B> for Linear<B> {
+    fn forward(&self, input: &Variable<B>, _is_training: bool) -> Result<Variable<B>, String> {
         input.matmul(&self.weight)?.add(&self.bias)
     }
-    fn parameters(&self) -> Vec<Variable> { vec![self.weight.clone(), self.bias.clone()] }
+    fn parameters(&self) -> Vec<Variable<B>> { vec![self.weight.clone(), self.bias.clone()] }
 }
 
-// 🎯 NEW: The Dropout Layer!
-#[derive(Serialize, Deserialize)]
-pub struct Dropout { pub p: f64 }
+// ==========================================
+// Utility Layers & Activations
+// ==========================================
 
-#[typetag::serde]
-impl Module for Dropout {
-    fn forward(&self, input: &Variable, is_training: bool) -> Result<Variable, String> {
+pub struct Flatten;
+
+impl<B: Backend> Module<B> for Flatten {
+    fn forward(&self, input: &Variable<B>, _is_training: bool) -> Result<Variable<B>, String> {
+        let in_shape = &input.data.borrow().shape;
+        if in_shape.len() < 2 {
+            return Err("Cannot flatten a tensor with less than 2 dimensions".to_string());
+        }
+        let batch_size = in_shape[0];
+        let flat_features: usize = in_shape[1..].iter().product(); 
+        Ok(input.reshape(vec![batch_size, flat_features]))
+    }
+}
+
+pub struct MaxPool2d { 
+    pub kernel_size: usize 
+}
+
+impl<B: Backend> Module<B> for MaxPool2d {
+    fn forward(&self, input: &Variable<B>, _is_training: bool) -> Result<Variable<B>, String> {
+        input.maxpool2d(self.kernel_size)
+    }
+}
+
+pub struct Dropout { 
+    pub p: f64 
+}
+
+impl<B: Backend> Module<B> for Dropout {
+    fn forward(&self, input: &Variable<B>, is_training: bool) -> Result<Variable<B>, String> {
         if is_training {
-            Ok(input.dropout(self.p)) // Destroys random nodes during training
+            Ok(input.dropout(self.p)) 
         } else {
-            Ok(input.clone()) // Transparent pass-through during testing
+            Ok(input.clone()) 
         }
     }
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct ReLU;
-#[typetag::serde]
-impl Module for ReLU {
-    fn forward(&self, input: &Variable, _is_training: bool) -> Result<Variable, String> { Ok(input.relu()) }
+impl<B: Backend> Module<B> for ReLU {
+    fn forward(&self, input: &Variable<B>, _is_training: bool) -> Result<Variable<B>, String> { Ok(input.relu()) }
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct Sigmoid;
-#[typetag::serde]
-impl Module for Sigmoid {
-    fn forward(&self, input: &Variable, _is_training: bool) -> Result<Variable, String> { Ok(input.sigmoid()) }
+impl<B: Backend> Module<B> for Sigmoid {
+    fn forward(&self, input: &Variable<B>, _is_training: bool) -> Result<Variable<B>, String> { Ok(input.sigmoid()) }
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct Tanh;
-#[typetag::serde]
-impl Module for Tanh {
-    fn forward(&self, input: &Variable, _is_training: bool) -> Result<Variable, String> { Ok(input.tanh()) }
+impl<B: Backend> Module<B> for Tanh {
+    fn forward(&self, input: &Variable<B>, _is_training: bool) -> Result<Variable<B>, String> { Ok(input.tanh()) }
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct Softmax;
-#[typetag::serde]
-impl Module for Softmax {
-    fn forward(&self, input: &Variable, _is_training: bool) -> Result<Variable, String> { Ok(input.softmax()) }
+impl<B: Backend> Module<B> for Softmax {
+    fn forward(&self, input: &Variable<B>, _is_training: bool) -> Result<Variable<B>, String> { Ok(input.softmax()) }
 }

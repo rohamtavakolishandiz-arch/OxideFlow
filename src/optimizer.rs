@@ -1,41 +1,32 @@
+// src/optimizer.rs
 use crate::autograd::Variable;
 use crate::tensor::Tensor;
-use serde::{Serialize, Deserialize};
-use std::fs::File;
-use std::io::{Read, Write};
+use crate::backend::Backend;
 
-pub trait Optimizer {
+pub trait Optimizer<B: Backend> {
     fn step(&mut self);
     fn zero_grad(&mut self);
     fn decay_lr(&mut self, factor: f64);
-    
-    // 🎯 NEW: Global gradient clipping to stabilize deep ResNets
     fn clip_grads(&self, max_norm: f64);
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct AdamWState {
-    pub lr: f64,
-    pub t: usize,
-    pub m: Vec<Tensor>,
-    pub v: Vec<Tensor>,
 }
 
 // ==========================================
 // SGD Implementation
 // ==========================================
 
-pub struct SGD {
-    parameters: Vec<Variable>,
+pub struct SGD<B: Backend> {
+    parameters: Vec<Variable<B>>,
     learning_rate: f64,
     momentum: f64,
-    velocities: Vec<Tensor>,
+    velocities: Vec<Tensor<B>>,
 }
 
-impl SGD {
-    pub fn new(parameters: Vec<Variable>, learning_rate: f64, momentum: f64) -> Self {
+impl<B: Backend> SGD<B> {
+    pub fn new(parameters: Vec<Variable<B>>, learning_rate: f64, momentum: f64) -> Self {
         let velocities = parameters.iter().map(|p| {
-            Tensor::zeros(p.data.borrow().shape.clone())
+            let shape = p.data.borrow().shape.clone();
+            let device = p.data.borrow().device.clone();
+            Tensor::zeros(device, shape)
         }).collect();
 
         Self {
@@ -47,25 +38,32 @@ impl SGD {
     }
 }
 
-impl Optimizer for SGD {
+impl<B: Backend> Optimizer<B> for SGD<B> {
     fn step(&mut self) {
         for (param, velocity) in self.parameters.iter().zip(self.velocities.iter_mut()) {
-            let mut p = param.data.borrow_mut();
-            let g = param.grad.borrow();
+            let shape = param.data.borrow().shape.clone();
+            let device = param.data.borrow().device.clone();
 
-            for i in 0..p.data.len() {
-                velocity.data[i] = (self.momentum * velocity.data[i]) + g.data[i];
-                p.data[i] -= self.learning_rate * velocity.data[i];
+            // Pull current state to CPU
+            let cpu_p = B::to_cpu(&device, &param.data.borrow().data);
+            let cpu_g = B::to_cpu(&device, &param.grad.borrow().data);
+            let mut cpu_v = B::to_cpu(&device, &velocity.data);
+            let mut new_p = cpu_p.clone();
+
+            for i in 0..cpu_p.len() {
+                cpu_v[i] = (self.momentum * cpu_v[i]) + cpu_g[i];
+                new_p[i] -= self.learning_rate * cpu_v[i];
             }
+
+            // Push updated state back to device
+            *param.data.borrow_mut() = Tensor::from_data(device.clone(), new_p, shape.clone()).unwrap();
+            *velocity = Tensor::from_data(device, cpu_v, shape).unwrap();
         }
     }
 
     fn zero_grad(&mut self) {
         for param in &self.parameters {
-            let mut grad = param.grad.borrow_mut();
-            for val in grad.data.iter_mut() {
-                *val = 0.0;
-            }
+            param.zero_grad();
         }
     }
     
@@ -82,27 +80,28 @@ impl Optimizer for SGD {
 // AdamW Implementation
 // ==========================================
 
-pub struct AdamW {
-    pub params: Vec<Variable>,
+pub struct AdamW<B: Backend> {
+    pub params: Vec<Variable<B>>,
     pub lr: f64,
     pub beta1: f64,
     pub beta2: f64,
     pub eps: f64,
     pub weight_decay: f64,
     t: usize,
-    m: Vec<Tensor>,
-    v: Vec<Tensor>,
+    m: Vec<Tensor<B>>,
+    v: Vec<Tensor<B>>,
 }
 
-impl AdamW {
-    pub fn new(params: Vec<Variable>, lr: f64, weight_decay: f64) -> Self {
+impl<B: Backend> AdamW<B> {
+    pub fn new(params: Vec<Variable<B>>, lr: f64, weight_decay: f64) -> Self {
         let mut m = Vec::new();
         let mut v = Vec::new();
         
         for p in &params {
             let shape = p.data.borrow().shape.clone();
-            m.push(Tensor::zeros(shape.clone()));
-            v.push(Tensor::zeros(shape));
+            let device = p.data.borrow().device.clone();
+            m.push(Tensor::zeros(device.clone(), shape.clone()));
+            v.push(Tensor::zeros(device, shape));
         }
     
         Self {
@@ -118,81 +117,59 @@ impl AdamW {
         }
     }
 
-    /// 🎯 Saves the optimizer's momentum and variance state
-    pub fn save(&self, path: &str) -> Result<(), String> {
-        let state = AdamWState {
-            lr: self.lr,
-            t: self.t,
-            m: self.m.clone(),
-            v: self.v.clone(),
-        };
-        
-        let json = serde_json::to_string_pretty(&state)
-            .map_err(|e| format!("Failed to serialize optimizer: {}", e))?;
-        let mut file = File::create(path).map_err(|e| format!("File Error: {}", e))?;
-        file.write_all(json.as_bytes()).map_err(|e| format!("Write Error: {}", e))?;
-        Ok(())
+    pub fn save(&self, _path: &str) -> Result<(), String> {
+        Err("Saving optimizer state is temporarily disabled during Backend Refactor".to_string())
     }
 
-    /// 🎯 Loads the state back into the optimizer to prevent gradient shocks
-    pub fn load(&mut self, path: &str) -> Result<(), String> {
-        let mut file = File::open(path).map_err(|e| format!("File Error: {}", e))?;
-        let mut json = String::new();
-        file.read_to_string(&mut json).map_err(|e| format!("Read Error: {}", e))?;
-        
-        let state: AdamWState = serde_json::from_str(&json)
-            .map_err(|e| format!("Parse Error: {}", e))?;
-        
-        // Overwrite current state with the loaded state
-        self.lr = state.lr;
-        self.t = state.t;
-        self.m = state.m;
-        self.v = state.v;
-        Ok(())
+    pub fn load(&mut self, _path: &str) -> Result<(), String> {
+        Err("Loading optimizer state is temporarily disabled during Backend Refactor".to_string())
     }
 }
 
-impl Optimizer for AdamW {
+impl<B: Backend> Optimizer<B> for AdamW<B> {
     fn zero_grad(&mut self) {
         for p in &self.params {
-            let mut grad = p.grad.borrow_mut();
-            for val in grad.data.iter_mut() {
-                *val = 0.0;
-            }
+            p.zero_grad();
         }
     }
 
     fn step(&mut self) {
         self.t += 1;
-        
-        // 🎯 FIX: Calculate bias correction ONCE per step, not inside the inner loop!
         let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
         let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
 
         for i in 0..self.params.len() {
-            let mut weight = self.params[i].data.borrow_mut();
-            let grad = self.params[i].grad.borrow();
-            
-            let m_tensor = &mut self.m[i];
-            let v_tensor = &mut self.v[i];
+            let p_var = &self.params[i];
+            let shape = p_var.data.borrow().shape.clone();
+            let device = p_var.data.borrow().device.clone();
 
-            // 🎯 FIX: Smart weight decay masking. 
-            // If the tensor is 1D or [1, N], it is a bias. Do not decay biases!
-            let is_bias = weight.shape.len() == 1 || (weight.shape.len() == 2 && weight.shape[0] == 1);
+            let is_bias = shape.len() == 1 || (shape.len() == 2 && shape[0] == 1);
             let current_wd = if is_bias { 0.0 } else { self.weight_decay };
 
-            for j in 0..weight.data.len() {
-                let g = grad.data[j];
-                let w = weight.data[j];
+            // 🎯 Package hyperparameters for the GPU
+            let config = crate::backend::AdamWConfig {
+                length: shape.iter().product::<usize>() as u32,
+                lr: self.lr as f32,
+                beta1: self.beta1 as f32,
+                beta2: self.beta2 as f32,
+                eps: self.eps as f32,
+                weight_decay: current_wd as f32,
+                bias_correction1: bias_correction1 as f32,
+                bias_correction2: bias_correction2 as f32,
+            };
 
-                m_tensor.data[j] = self.beta1 * m_tensor.data[j] + (1.0 - self.beta1) * g;
-                v_tensor.data[j] = self.beta2 * v_tensor.data[j] + (1.0 - self.beta2) * g * g;
+            let mut weight = p_var.data.borrow_mut();
+            let grad = p_var.grad.borrow();
 
-                let m_hat = m_tensor.data[j] / bias_correction1;
-                let v_hat = v_tensor.data[j] / bias_correction2;
-
-                weight.data[j] = w - self.lr * (m_hat / (v_hat.sqrt() + self.eps) + current_wd * w);
-            }
+            // 🎯 Delegate execution entirely to the hardware Backend
+            B::adamw_step(
+                &device,
+                &mut weight.data,
+                &grad.data,
+                &mut self.m[i].data,
+                &mut self.v[i].data,
+                &config
+            );
         }
     }
     
@@ -209,14 +186,14 @@ impl Optimizer for AdamW {
 // Helper Functions
 // ==========================================
 
-/// 🎯 NEW: Calculates the global norm across all parameters and scales gradients if they exceed max_norm.
-fn clip_global_norm(parameters: &Vec<Variable>, max_norm: f64) {
+fn clip_global_norm<B: Backend>(parameters: &Vec<Variable<B>>, max_norm: f64) {
     let mut total_norm = 0.0;
     
-    // 1. Calculate the L2 norm of all gradients combined
+    // 1. Calculate the L2 norm of all gradients combined (Pulling to CPU)
     for p in parameters {
-        let grad = p.grad.borrow();
-        for &g in &grad.data {
+        let device = p.grad.borrow().device.clone();
+        let cpu_g = B::to_cpu(&device, &p.grad.borrow().data);
+        for &g in &cpu_g {
             total_norm += g * g;
         }
     }
@@ -226,10 +203,14 @@ fn clip_global_norm(parameters: &Vec<Variable>, max_norm: f64) {
     if total_norm > max_norm {
         let scale = max_norm / (total_norm + 1e-6);
         for p in parameters {
-            let mut grad = p.grad.borrow_mut();
-            for g in grad.data.iter_mut() {
+            let device = p.grad.borrow().device.clone();
+            let shape = p.grad.borrow().shape.clone();
+            let mut cpu_g = B::to_cpu(&device, &p.grad.borrow().data);
+            
+            for g in cpu_g.iter_mut() {
                 *g *= scale;
             }
+            *p.grad.borrow_mut() = Tensor::from_data(device, cpu_g, shape).unwrap();
         }
     }
 }

@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use crate::tensor::Tensor;
 use crate::autograd::Variable;
+use crate::backend::Backend;
 
 fn read_u32_be<R: Read>(reader: &mut R) -> io::Result<u32> {
     let mut buf = [0u8; 4];
@@ -9,13 +10,13 @@ fn read_u32_be<R: Read>(reader: &mut R) -> io::Result<u32> {
     Ok(u32::from_be_bytes(buf))
 }
 
-pub struct MNISTDataset {
-    pub inputs: Vec<Variable>,
-    pub targets: Vec<Variable>,
+pub struct MNISTDataset<B: Backend> {
+    pub inputs: Vec<Variable<B>>,
+    pub targets: Vec<Variable<B>>,
 }
 
-impl MNISTDataset {
-    pub fn load(img_path: &str, lbl_path: &str, max_samples: Option<usize>) -> Result<Self, String> {
+impl<B: Backend> MNISTDataset<B> {
+    pub fn load(device: B, img_path: &str, lbl_path: &str, max_samples: Option<usize>) -> Result<Self, String> {
         let mut img_file = File::open(img_path).map_err(|e| format!("Failed to open image file: {}", e))?;
         let mut lbl_file = File::open(lbl_path).map_err(|e| format!("Failed to open label file: {}", e))?;
 
@@ -54,14 +55,15 @@ impl MNISTDataset {
                 .map(|&p| p as f64 / 255.0)
                 .collect();
 
-                inputs.push(Variable::new(Tensor::from_data(img_f64, vec![1, 1, 28, 28]).unwrap()));
+            // 🎯 Allocate directly to the target device
+            inputs.push(Variable::new(Tensor::from_data(device.clone(), img_f64, vec![1, 1, 28, 28]).unwrap()));
 
             // One-hot encode the 10 possible digit classes
             let label = raw_labels[i] as usize;
             let mut target_vec = vec![0.0; 10];
             target_vec[label] = 1.0;
             
-            targets.push(Variable::new(Tensor::from_data(target_vec, vec![1, 10]).unwrap()));
+            targets.push(Variable::new(Tensor::from_data(device.clone(), target_vec, vec![1, 10]).unwrap()));
         }
 
         Ok(Self { inputs, targets })

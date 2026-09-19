@@ -5,3 +5,6 @@ pub mod nn;
 pub mod data;
 pub mod mnist;
 pub mod cifar;
+pub mod backend;
+pub mod checkpoint;
+pub mod renderer;
