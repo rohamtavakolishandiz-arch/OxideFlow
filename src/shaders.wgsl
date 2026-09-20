@@ -17,6 +17,22 @@ fn add_forward(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 }
 
+@compute @workgroup_size(64)
+fn sub_forward(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let i = global_id.x;
+    if (i < dims.length) {
+        out[i] = a[i] - b[i];
+    }
+}
+
+@compute @workgroup_size(64)
+fn mul_forward(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let i = global_id.x;
+    if (i < dims.length) {
+        out[i] = a[i] * b[i];
+    }
+}
+
 // src/shaders.wgsl (Append this to the bottom)
 
 struct MatmulDims {
@@ -536,5 +552,184 @@ fn sum_forward(@builtin(global_invocation_id) global_id: vec3<u32>) {
             sum_val = sum_val + red_in[i];
         }
         red_out[0] = sum_val;
+    }
+}
+
+struct BroadcastDims {
+    r1: u32,
+    c1: u32,
+    r2: u32,
+    c2: u32,
+}
+@group(0) @binding(3) var<uniform> b_dims: BroadcastDims;
+
+@compute @workgroup_size(64)
+fn add_broadcast_forward(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let idx = global_id.x;
+    let out_r = max(b_dims.r1, b_dims.r2);
+    let out_c = max(b_dims.c1, b_dims.c2);
+    
+    if (idx < out_r * out_c) {
+        let row = idx / out_c;
+        let col = idx % out_c;
+        
+        // Modulo arithmetic naturally handles the 1-dimension stretching
+        let a_idx = (row % b_dims.r1) * b_dims.c1 + (col % b_dims.c1);
+        let b_idx = (row % b_dims.r2) * b_dims.c2 + (col % b_dims.c2);
+        
+        out[idx] = a[a_idx] + b[b_idx];
+    }
+}
+
+struct BatchNormDims {
+    batch: u32,
+    c: u32,
+    h: u32,
+    w: u32,
+    eps: f32,
+    momentum: f32,
+    is_training: u32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> bn_in: array<f32>;
+@group(0) @binding(1) var<storage, read> bn_weight: array<f32>; // Gamma
+@group(0) @binding(2) var<storage, read> bn_bias: array<f32>;   // Beta
+@group(0) @binding(3) var<storage, read_write> bn_run_mean: array<f32>;
+@group(0) @binding(4) var<storage, read_write> bn_run_var: array<f32>;
+@group(0) @binding(5) var<storage, read_write> bn_out: array<f32>;
+@group(0) @binding(6) var<uniform> bn_dims: BatchNormDims;
+
+@compute @workgroup_size(64)
+fn batch_norm2d_forward(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let c = global_id.x;
+    
+    if (c < bn_dims.c) {
+        let spatial_size = bn_dims.h * bn_dims.w;
+        let batch_size = bn_dims.batch;
+        let num_elements = f32(batch_size * spatial_size);
+        
+        var mean: f32 = bn_run_mean[c];
+        var variance: f32 = bn_run_var[c];
+
+        if (bn_dims.is_training == 1u) {
+            // 1. Calculate Mean for this channel
+            var sum: f32 = 0.0;
+            for (var b: u32 = 0u; b < batch_size; b = b + 1u) {
+                let offset = b * bn_dims.c * spatial_size + c * spatial_size;
+                for (var i: u32 = 0u; i < spatial_size; i = i + 1u) {
+                    sum = sum + bn_in[offset + i];
+                }
+            }
+            mean = sum / num_elements;
+            
+            // 2. Calculate Variance for this channel
+            var var_sum: f32 = 0.0;
+            for (var b: u32 = 0u; b < batch_size; b = b + 1u) {
+                let offset = b * bn_dims.c * spatial_size + c * spatial_size;
+                for (var i: u32 = 0u; i < spatial_size; i = i + 1u) {
+                    let diff = bn_in[offset + i] - mean;
+                    var_sum = var_sum + (diff * diff);
+                }
+            }
+            variance = var_sum / num_elements;
+            
+            // 3. Update running stats directly in VRAM
+            bn_run_mean[c] = (1.0 - bn_dims.momentum) * bn_run_mean[c] + bn_dims.momentum * mean;
+            bn_run_var[c] = (1.0 - bn_dims.momentum) * bn_run_var[c] + bn_dims.momentum * variance;
+        }
+
+        // 4. Apply Normalization and Affine Transform (Gamma & Beta)
+        let inv_std = 1.0 / sqrt(variance + bn_dims.eps);
+        let gamma = bn_weight[c];
+        let beta = bn_bias[c];
+        
+        for (var b: u32 = 0u; b < batch_size; b = b + 1u) {
+            let offset = b * bn_dims.c * spatial_size + c * spatial_size;
+            for (var i: u32 = 0u; i < spatial_size; i = i + 1u) {
+                let idx = offset + i;
+                bn_out[idx] = (bn_in[idx] - mean) * inv_std * gamma + beta;
+            }
+        }
+    }
+}
+
+// ==========================================
+// 2D BATCH NORMALIZATION BACKWARD
+// ==========================================
+
+@group(0) @binding(0) var<storage, read> bn_in_b: array<f32>;
+@group(0) @binding(1) var<storage, read> bn_grad_out: array<f32>;
+@group(0) @binding(2) var<storage, read> bn_weight_b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> bn_grad_in: array<f32>;
+@group(0) @binding(4) var<storage, read_write> bn_grad_weight: array<f32>;
+@group(0) @binding(5) var<storage, read_write> bn_grad_bias: array<f32>;
+@group(0) @binding(6) var<uniform> bn_dims_b: BatchNormDims;
+
+@compute @workgroup_size(64)
+fn batch_norm2d_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let c = global_id.x;
+    
+    if (c < bn_dims_b.c) {
+        let spatial_size = bn_dims_b.h * bn_dims_b.w;
+        let batch_size = bn_dims_b.batch;
+        let num_elements = f32(batch_size * spatial_size);
+
+        // 1. Recompute batch mean for this channel
+        var sum: f32 = 0.0;
+        for (var b: u32 = 0u; b < batch_size; b = b + 1u) {
+            let offset = b * bn_dims_b.c * spatial_size + c * spatial_size;
+            for (var i: u32 = 0u; i < spatial_size; i = i + 1u) {
+                sum = sum + bn_in_b[offset + i];
+            }
+        }
+        let mean = sum / num_elements;
+
+        // 2. Recompute batch variance for this channel
+        var var_sum: f32 = 0.0;
+        for (var b: u32 = 0u; b < batch_size; b = b + 1u) {
+            let offset = b * bn_dims_b.c * spatial_size + c * spatial_size;
+            for (var i: u32 = 0u; i < spatial_size; i = i + 1u) {
+                let diff = bn_in_b[offset + i] - mean;
+                var_sum = var_sum + (diff * diff);
+            }
+        }
+        let variance = var_sum / num_elements;
+        let inv_std = 1.0 / sqrt(variance + bn_dims_b.eps);
+        let gamma = bn_weight_b[c];
+
+        // 3. Compute gradients for Gamma (Weight) and Beta (Bias)
+        var d_beta: f32 = 0.0;
+        var d_gamma: f32 = 0.0;
+        
+        for (var b: u32 = 0u; b < batch_size; b = b + 1u) {
+            let offset = b * bn_dims_b.c * spatial_size + c * spatial_size;
+            for (var i: u32 = 0u; i < spatial_size; i = i + 1u) {
+                let idx = offset + i;
+                let x_hat = (bn_in_b[idx] - mean) * inv_std;
+                let dy = bn_grad_out[idx];
+                
+                d_beta = d_beta + dy;
+                d_gamma = d_gamma + (dy * x_hat);
+            }
+        }
+        
+        bn_grad_bias[c] = d_beta;
+        bn_grad_weight[c] = d_gamma;
+
+        // 4. Compute gradient for Inputs
+        let scale = (gamma * inv_std) / num_elements;
+        
+        for (var b: u32 = 0u; b < batch_size; b = b + 1u) {
+            let offset = b * bn_dims_b.c * spatial_size + c * spatial_size;
+            for (var i: u32 = 0u; i < spatial_size; i = i + 1u) {
+                let idx = offset + i;
+                let x_hat = (bn_in_b[idx] - mean) * inv_std;
+                let dy = bn_grad_out[idx];
+                
+                // The simplified backward formula for BatchNorm input
+                bn_grad_in[idx] = scale * (num_elements * dy - d_beta - x_hat * d_gamma);
+            }
+        }
     }
 }

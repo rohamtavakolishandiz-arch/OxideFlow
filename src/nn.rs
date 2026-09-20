@@ -75,7 +75,6 @@ impl<B: Backend> Conv2d<B> {
         let fan_in = in_channels * kernel_size * kernel_size; 
         let kaiming_scale = (2.0 / fan_in as f64).sqrt();
         
-        // 🎯 Kaiming Init on CPU before allocating to the Backend
         let mut rng = rand::thread_rng();
         let mut data = Vec::with_capacity(len);
         for _ in 0..len {
@@ -104,6 +103,51 @@ impl<B: Backend> Module<B> for Conv2d<B> {
     fn parameters(&self) -> Vec<Variable<B>> { vec![self.weight.clone(), self.bias.clone()] }
 }
 
+pub struct BatchNorm2d<B: Backend> {
+    pub weight: Variable<B>, // Gamma
+    pub bias: Variable<B>,   // Beta
+    pub running_mean: Tensor<B>,
+    pub running_var: Tensor<B>,
+    pub momentum: f64,
+    pub eps: f64,
+}
+
+impl<B: Backend> BatchNorm2d<B> {
+    pub fn new(device: B, num_features: usize) -> Self {
+        let weight_tensor = Tensor::from_data(device.clone(), vec![1.0; num_features], vec![num_features]).unwrap();
+        let bias_tensor = Tensor::zeros(device.clone(), vec![num_features]);
+        let running_mean = Tensor::zeros(device.clone(), vec![num_features]);
+        let running_var = Tensor::from_data(device.clone(), vec![1.0; num_features], vec![num_features]).unwrap();
+        
+        Self {
+            weight: Variable::new(weight_tensor),
+            bias: Variable::new(bias_tensor),
+            running_mean,
+            running_var,
+            momentum: 0.1,
+            eps: 1e-5,
+        }
+    }
+}
+
+impl<B: Backend> Module<B> for BatchNorm2d<B> {
+    fn forward(&self, input: &Variable<B>, is_training: bool) -> Result<Variable<B>, String> {
+        input.batch_norm2d(
+            &self.weight, 
+            &self.bias, 
+            &self.running_mean, 
+            &self.running_var, 
+            is_training, 
+            self.momentum, 
+            self.eps
+        )
+    }
+    
+    fn parameters(&self) -> Vec<Variable<B>> { 
+        vec![self.weight.clone(), self.bias.clone()] 
+    }
+}
+
 pub struct Linear<B: Backend> {
     pub weight: Variable<B>,
     pub bias: Variable<B>,
@@ -114,7 +158,6 @@ impl<B: Backend> Linear<B> {
         let len = in_features * out_features;
         let kaiming_scale = (2.0 / in_features as f64).sqrt();
         
-        // 🎯 Kaiming Init on CPU before allocating to the Backend
         let mut rng = rand::thread_rng();
         let mut data = Vec::with_capacity(len);
         for _ in 0..len {

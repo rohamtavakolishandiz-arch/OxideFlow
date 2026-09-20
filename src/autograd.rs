@@ -21,6 +21,7 @@ pub enum Op<B: Backend> {
     Reshape(Variable<B>, Vec<usize>),
     Conv2d(Variable<B>, Variable<B>, Variable<B>, usize, usize),
     MaxPool2d(Variable<B>, usize),
+    BatchNorm2d(Variable<B>, Variable<B>, Variable<B>, f64),
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +38,17 @@ impl<B: Backend> Variable<B> {
         Self {
             data: Rc::new(RefCell::new(tensor)),
             grad: Rc::new(RefCell::new(Tensor::zeros(device, shape))),
+            creator: Rc::new(Op::None),
+        }
+    }
+
+    // 🎯 NEW: Skip full gradient allocation for constants (inputs/targets)
+    pub fn new_constant(tensor: Tensor<B>) -> Self {
+        let device = tensor.device.clone();
+        Self {
+            data: Rc::new(RefCell::new(tensor)),
+            // Allocate a tiny 1-element dummy buffer to satisfy the type system without VRAM overhead
+            grad: Rc::new(RefCell::new(Tensor::zeros(device, vec![1]))), 
             creator: Rc::new(Op::None),
         }
     }
@@ -92,6 +104,11 @@ impl<B: Backend> Variable<B> {
                         build_topo(a, topo, visited);
                     }
                     Op::Conv2d(a, b, c, _, _) => {
+                        build_topo(a, topo, visited);
+                        build_topo(b, topo, visited);
+                        build_topo(c, topo, visited);
+                    }
+                    Op::BatchNorm2d(a, b, c, _) => { // <-- Add the comma and underscore
                         build_topo(a, topo, visited);
                         build_topo(b, topo, visited);
                         build_topo(c, topo, visited);
@@ -285,6 +302,16 @@ impl<B: Backend> Variable<B> {
             Op::MaxPool2d(parent, kernel_size) => {
                 let parent_grad = parent.data.borrow().maxpool2d_backward(&grad_value, *kernel_size);
                 Self::update_grad(parent, &parent_grad);
+            }
+            Op::BatchNorm2d(input, weight, bias, eps) => {
+                let (grad_in, grad_w, grad_b) = input.data.borrow().batch_norm2d_backward(
+                    &grad_value,
+                    &weight.data.borrow(),
+                    *eps,
+                );
+                Self::update_grad(input, &grad_in);
+                Self::update_grad(weight, &grad_w);
+                Self::update_grad(bias, &grad_b);
             }
             Op::None => {}
         }
@@ -493,6 +520,33 @@ impl<B: Backend> Variable<B> {
             data: Rc::new(RefCell::new(result)),
             grad: Rc::new(RefCell::new(Tensor::zeros(device, shape))),
             creator: Rc::new(Op::MaxPool2d(self.clone(), kernel_size)),
+        })
+    }
+    pub fn batch_norm2d(
+        &self,
+        weight: &Variable<B>,
+        bias: &Variable<B>,
+        running_mean: &Tensor<B>,
+        running_var: &Tensor<B>,
+        is_training: bool,
+        momentum: f64,
+        eps: f64,
+    ) -> Result<Self, String> {
+        let result_tensor = self.data.borrow().batch_norm2d(
+            &weight.data.borrow(),
+            &bias.data.borrow(),
+            running_mean,
+            running_var,
+            is_training,
+            momentum,
+            eps,
+        )?;
+        let shape = result_tensor.shape.clone();
+        let device = result_tensor.device.clone();
+        Ok(Self {
+            data: Rc::new(RefCell::new(result_tensor)),
+            grad: Rc::new(RefCell::new(Tensor::zeros(device, shape))),
+            creator: Rc::new(Op::BatchNorm2d(self.clone(), weight.clone(), bias.clone(), eps)),
         })
     }
 }

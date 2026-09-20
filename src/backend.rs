@@ -54,6 +54,17 @@ struct ReductionDims {
     _pad3: u32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct BroadcastDims { r1: u32, c1: u32, r2: u32, c2: u32 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct BatchNormDims {
+    batch: u32, c: u32, h: u32, w: u32,
+    eps: f32, momentum: f32, is_training: u32, _pad: u32,
+}
+
 // ==========================================
 // BACKEND TRAIT
 // ==========================================
@@ -88,6 +99,18 @@ pub trait Backend: Clone + 'static {
 
     // 🎯 The New Optimizer Route
     fn adamw_step(device: &Self, weight: &mut Self::Buffer, grad: &Self::Buffer, m: &mut Self::Buffer, v: &mut Self::Buffer, config: &AdamWConfig);
+
+    fn batch_norm2d(
+        device: &Self, input: &Self::Buffer, shape: &[usize],
+        weight: &Self::Buffer, bias: &Self::Buffer,
+        running_mean: &Self::Buffer, running_var: &Self::Buffer,
+        is_training: bool, momentum: f64, eps: f64
+    ) -> Result<Self::Buffer, String>;
+
+    fn batch_norm2d_backward(
+        device: &Self, input: &Self::Buffer, shape: &[usize],
+        grad_out: &Self::Buffer, weight: &Self::Buffer, eps: f64
+    ) -> (Self::Buffer, Self::Buffer, Self::Buffer);
 
     fn to_cpu(device: &Self, buffer: &Self::Buffer) -> Vec<f64>;
 }
@@ -303,6 +326,21 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn batch_norm2d(
+        _device: &Self, _input: &Self::Buffer, _shape: &[usize],
+        _weight: &Self::Buffer, _bias: &Self::Buffer,
+        _running_mean: &Self::Buffer, _running_var: &Self::Buffer,
+        _is_training: bool, _momentum: f64, _eps: f64
+    ) -> Result<Self::Buffer, String> {
+        unimplemented!("BatchNorm2d for CpuBackend is not implemented yet")
+    }
+
+    fn batch_norm2d_backward(
+        _d: &Self, _i: &Self::Buffer, _s: &[usize], _go: &Self::Buffer, _w: &Self::Buffer, _eps: f64
+    ) -> (Self::Buffer, Self::Buffer, Self::Buffer) {
+        unimplemented!("BatchNorm backward on CPU is not implemented yet")
+    }
+
     fn to_cpu(_device: &Self, buffer: &Self::Buffer) -> Vec<f64> { buffer.clone() }
 }
 
@@ -344,6 +382,50 @@ impl Drop for WgpuBuffer {
 }
 
 impl WgpuBackend {
+
+    pub fn with_surface(window: Arc<winit::window::Window>) -> (Self, wgpu::Surface<'static>, wgpu::SurfaceConfiguration) {
+        let (device, queue, surface, config) = pollster::block_on(async {
+            let instance = wgpu::Instance::default();
+            
+            // Create the surface from the winit window
+            let surface = instance.create_surface(window.clone()).unwrap();
+            
+            let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
+                compatible_surface: Some(&surface),
+                ..Default::default()
+            }).await.unwrap();
+            
+            let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default()).await.unwrap();
+            
+            let size = window.inner_size();
+            let caps = surface.get_capabilities(&adapter);
+            let format = caps.formats[0]; // Pick the preferred format for the display
+            
+            let config = wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                width: size.width,
+                height: size.height,
+                present_mode: wgpu::PresentMode::Fifo,
+                alpha_mode: caps.alpha_modes[0],
+                view_formats: vec![],
+                desired_maximum_frame_latency: 2,
+                color_space: wgpu::SurfaceColorSpace::Auto, // <--- ADD THIS LINE
+            };
+            surface.configure(&device, &config);
+            
+            (device, queue, surface, config)
+        });
+        
+        let backend = Self {
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+            pipelines: Arc::new(RwLock::new(HashMap::new())),
+            pool: Arc::new(RwLock::new(HashMap::new())), // Active Memory Pool
+        };
+        
+        (backend, surface, config)
+    }
     // 🎯 Fast VRAM Allocator
     fn allocate(&self, size: wgpu::BufferAddress) -> Arc<wgpu::Buffer> {
         // 1. Check if we have a recycled buffer of the exact size
@@ -505,8 +587,49 @@ impl Backend for WgpuBackend {
         result_f32.iter().map(|&x| x as f64).collect()
     }
 
-    fn add(device: &Self, a: &Self::Buffer, shape_a: &[usize], b: &Self::Buffer, _shape_b: &[usize]) -> Result<(Self::Buffer, Vec<usize>), String> {
-        Ok((device.dispatch_binary(a, b, "add_forward"), shape_a.to_vec()))
+    fn add(device: &Self, a: &Self::Buffer, shape_a: &[usize], b: &Self::Buffer, shape_b: &[usize]) -> Result<(Self::Buffer, Vec<usize>), String> {
+        if shape_a == shape_b {
+            return Ok((device.dispatch_binary(a, b, "add_forward"), shape_a.to_vec()));
+        }
+    
+        if shape_a.len() == 2 && shape_b.len() == 2 {
+            let (r1, c1) = (shape_a[0], shape_a[1]);
+            let (r2, c2) = (shape_b[0], shape_b[1]);
+            
+            if (c1 == c2 && (r1 == 1 || r2 == 1)) || (r1 == r2 && (c1 == 1 || c2 == 1)) {
+                let out_shape = vec![r1.max(r2), c1.max(c2)];
+                let out_buffer = Self::zeros(device, &out_shape);
+                let dims = BroadcastDims { r1: r1 as u32, c1: c1 as u32, r2: r2 as u32, c2: c2 as u32 };
+                
+                let compute_pipeline = device.get_pipeline("add_broadcast_forward");
+                let dims_buffer = device.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Broadcast Dims"), contents: bytemuck::cast_slice(&[dims]), usage: wgpu::BufferUsages::UNIFORM,
+                });
+    
+                let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None, layout: &compute_pipeline.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: a.buffer.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: b.buffer.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: out_buffer.buffer.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: dims_buffer.as_entire_binding() },
+                    ],
+                });
+    
+                let mut encoder = device.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                    cpass.set_pipeline(&compute_pipeline);
+                    cpass.set_bind_group(0, &bind_group, &[]);
+                    let out_len = (out_shape[0] * out_shape[1]) as u32;
+                    cpass.dispatch_workgroups((out_len + 63) / 64, 1, 1);
+                }
+                device.queue.submit(Some(encoder.finish()));
+                
+                return Ok((out_buffer, out_shape));
+            }
+        }
+        Err("Cannot add or broadcast GPU tensors".to_string())
     }
     fn sub(device: &Self, a: &Self::Buffer, b: &Self::Buffer, _shape: &[usize]) -> Result<Self::Buffer, String> { Ok(device.dispatch_binary(a, b, "sub_forward")) }
     fn mul_elementwise(device: &Self, a: &Self::Buffer, b: &Self::Buffer, _sa: &[usize], _sb: &[usize]) -> Result<Self::Buffer, String> { Ok(device.dispatch_binary(a, b, "mul_forward")) }
@@ -845,4 +968,95 @@ impl Backend for WgpuBackend {
         device.queue.submit(Some(encoder.finish()));
         grad_in
     }
+
+    fn batch_norm2d(
+        device: &Self, input: &Self::Buffer, shape: &[usize],
+        weight: &Self::Buffer, bias: &Self::Buffer,
+        running_mean: &Self::Buffer, running_var: &Self::Buffer,
+        is_training: bool, momentum: f64, eps: f64
+    ) -> Result<Self::Buffer, String> {
+        let (batch, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+        let dims = BatchNormDims {
+            batch: batch as u32, c: c as u32, h: h as u32, w: w as u32,
+            eps: eps as f32, momentum: momentum as f32, 
+            is_training: if is_training { 1 } else { 0 }, _pad: 0,
+        };
+        
+        let out_buffer = Self::zeros(device, shape);
+        let compute_pipeline = device.get_pipeline("batch_norm2d_forward");
+
+        let dims_buffer = device.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("BN Dims"), contents: bytemuck::cast_slice(&[dims]), usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &compute_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: input.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: weight.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: bias.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: running_mean.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: running_var.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: out_buffer.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: dims_buffer.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = device.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            cpass.set_pipeline(&compute_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            // Dispatch 1 thread per channel
+            cpass.dispatch_workgroups(((c as u32) + 63) / 64, 1, 1); 
+        }
+        device.queue.submit(Some(encoder.finish()));
+        
+        Ok(out_buffer)
+    }
+
+    fn batch_norm2d_backward(
+        device: &Self, input: &Self::Buffer, shape: &[usize],
+        grad_out: &Self::Buffer, weight: &Self::Buffer, eps: f64
+    ) -> (Self::Buffer, Self::Buffer, Self::Buffer) {
+        let (batch, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+        let dims = BatchNormDims {
+            batch: batch as u32, c: c as u32, h: h as u32, w: w as u32,
+            eps: eps as f32, momentum: 0.0, is_training: 0, _pad: 0,
+        };
+        
+        let grad_in = Self::zeros(device, shape);
+        let grad_w = Self::zeros(device, &[c]);
+        let grad_b = Self::zeros(device, &[c]);
+        
+        let compute_pipeline = device.get_pipeline("batch_norm2d_backward");
+        let dims_buffer = device.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("BN BW Dims"), contents: bytemuck::cast_slice(&[dims]), usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &compute_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: input.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: grad_out.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: weight.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: grad_in.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: grad_w.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: grad_b.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: dims_buffer.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = device.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            cpass.set_pipeline(&compute_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.dispatch_workgroups(((c as u32) + 63) / 64, 1, 1);
+        }
+        device.queue.submit(Some(encoder.finish()));
+        
+        (grad_in, grad_w, grad_b)
+    }
+    
 }

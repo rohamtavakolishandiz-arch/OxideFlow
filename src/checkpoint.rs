@@ -55,6 +55,13 @@ pub fn load_state_dict<B: Backend>(
         file.read_exact(&mut dims_bytes)?;
         let dims = u64::from_le_bytes(dims_bytes) as usize;
 
+        // 1. Pre-validate against the trusted in-memory tensor BEFORE allocating
+        let mut tensor = param.data.borrow_mut();
+        if dims != tensor.shape.len() {
+            return Err(Error::new(ErrorKind::InvalidData, "Dimension count mismatch! Corrupted file or wrong model."));
+        }
+
+        // 2. Safely allocate the Vector
         let mut shape = Vec::with_capacity(dims);
         for _ in 0..dims {
             let mut dim_bytes = [0u8; 8];
@@ -62,7 +69,7 @@ pub fn load_state_dict<B: Backend>(
             shape.push(u64::from_le_bytes(dim_bytes) as usize);
         }
 
-        let mut tensor = param.data.borrow_mut();
+        // 3. Verify exact shape dimensions
         if tensor.shape != shape {
             return Err(Error::new(ErrorKind::InvalidData, "Shape mismatch! The saved weights don't fit this layer."));
         }
