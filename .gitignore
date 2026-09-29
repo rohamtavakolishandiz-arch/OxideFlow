@@ -1,3 +1,9 @@
-/target
-# Model checkpoints
-*.json
+# Ignore the compiled Rust binaries
+/target/
+
+# Ignore the saved Neural Network brains
+*.bin
+
+# Ignore OS files
+.DS_Store
+Thumbs.db

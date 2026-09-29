@@ -91,6 +91,21 @@ impl GpuRenderer {
         vertices.push(Vertex { position: p3, color, uv: [1.0, 0.0], obj_type: 1.0 });
     }
 
+    pub fn push_rect(vertices: &mut Vec<Vertex>, x: f32, y: f32, w: f32, h: f32, color: [f32; 4], screen_w: f32, screen_h: f32) {
+        let p0 = [(x / screen_w) * 2.0 - 1.0, 1.0 - (y / screen_h) * 2.0];
+        let p1 = [(x / screen_w) * 2.0 - 1.0, 1.0 - ((y + h) / screen_h) * 2.0];
+        let p2 = [((x + w) / screen_w) * 2.0 - 1.0, 1.0 - ((y + h) / screen_h) * 2.0];
+        let p3 = [((x + w) / screen_w) * 2.0 - 1.0, 1.0 - (y / screen_h) * 2.0];
+
+        // We use obj_type: 0.0 to render a solid square
+        vertices.push(Vertex { position: p0, color, uv: [0.0, 0.0], obj_type: 0.0 });
+        vertices.push(Vertex { position: p1, color, uv: [0.0, 1.0], obj_type: 0.0 });
+        vertices.push(Vertex { position: p2, color, uv: [1.0, 1.0], obj_type: 0.0 });
+        vertices.push(Vertex { position: p0, color, uv: [0.0, 0.0], obj_type: 0.0 });
+        vertices.push(Vertex { position: p2, color, uv: [1.0, 1.0], obj_type: 0.0 });
+        vertices.push(Vertex { position: p3, color, uv: [1.0, 0.0], obj_type: 0.0 });
+    }
+
     pub fn render(&self, device: &wgpu::Device, queue: &wgpu::Queue, view: &wgpu::TextureView, vertices: &[Vertex]) {
         if vertices.is_empty() { return; }
         

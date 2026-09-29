@@ -1,5 +1,6 @@
 use std::fmt;
 use crate::backend::Backend;
+use crate::error::{OxideError, Result}; // Import the new Error Architecture
 
 #[derive(Clone, Debug)]
 pub struct Tensor<B: Backend> {
@@ -9,12 +10,15 @@ pub struct Tensor<B: Backend> {
 }
 
 impl<B: Backend> Tensor<B> {
-    pub fn from_data(device: B, data: Vec<f64>, shape: Vec<usize>) -> Result<Self, String> {
+    pub fn from_data(device: B, data: Vec<f64>, shape: Vec<usize>) -> Result<Self> {
         let expected_len: usize = shape.iter().product();
         if data.len() != expected_len {
-            return Err(format!("Shape mismatch: expected {} elements, but got {}", expected_len, data.len()));
+            return Err(OxideError::MathError(format!(
+                "Buffer length mismatch: expected {} elements, but got {}", 
+                expected_len, data.len()
+            )));
         }
-        // 🎯 Route allocation to the hardware backend
+        // Route allocation to the hardware backend
         let buffer = B::from_data(&device, data, &shape);
         Ok(Self { data: buffer, shape, device })
     }
@@ -29,11 +33,14 @@ impl<B: Backend> Tensor<B> {
         Self { data: buffer, shape, device }
     }
 
-    pub fn reshape(&self, new_shape: Vec<usize>) -> Result<Self, String> {
+    pub fn reshape(&self, new_shape: Vec<usize>) -> Result<Self> {
         let expected_len: usize = new_shape.iter().product();
         let current_len: usize = self.shape.iter().product();
         if expected_len != current_len {
-            return Err(format!("Cannot reshape tensor of {} elements into shape {:?}", current_len, new_shape));
+            return Err(OxideError::MathError(format!(
+                "Cannot reshape tensor of {} elements into shape {:?}", 
+                current_len, new_shape
+            )));
         }
         Ok(Self {
             data: self.data.clone(), 
@@ -43,42 +50,49 @@ impl<B: Backend> Tensor<B> {
     }
 
     // ==========================================
-    // 🎯 Delegated Math Operations 
-    // All math is handled by the generic B hardware
+    // Delegated Math Operations 
     // ==========================================
 
-    pub fn add(&self, other: &Tensor<B>) -> Result<Self, String> {
-        let (out_data, out_shape) = B::add(&self.device, &self.data, &self.shape, &other.data, &other.shape)?;
+    pub fn add(&self, other: &Tensor<B>) -> Result<Self> {
+        // Let the hardware backend handle both identical shapes and 2D broadcasting
+        let (out_data, out_shape) = B::add(&self.device, &self.data, &self.shape, &other.data, &other.shape)
+            .map_err(OxideError::GpuError)?;
+        
         Ok(Self { data: out_data, shape: out_shape, device: self.device.clone() })
     }
 
-    pub fn sub(&self, other: &Tensor<B>) -> Result<Self, String> {
+    pub fn sub(&self, other: &Tensor<B>) -> Result<Self> {
         if self.shape != other.shape {
-            return Err(format!("Shape mismatch in sub: {:?} != {:?}", self.shape, other.shape));
+            return Err(OxideError::ShapeMismatch {
+                expected: self.shape.clone(),
+                actual: other.shape.clone(),
+            });
         }
-        let out_data = B::sub(&self.device, &self.data, &other.data, &self.shape)?;
+        let out_data = B::sub(&self.device, &self.data, &other.data, &self.shape)
+            .map_err(OxideError::GpuError)?;
         Ok(Self { data: out_data, shape: self.shape.clone(), device: self.device.clone() })
     }
 
-    pub fn matmul(&self, other: &Tensor<B>) -> Result<Self, String> {
+    pub fn matmul(&self, other: &Tensor<B>) -> Result<Self> {
         // 1. Verify Rank 2 (Matrices)
-        if self.shape.len() != 2 || other.shape.len() != 2 {
-            return Err(format!(
-                "Matmul requires exactly 2D tensors, but got shapes {:?} and {:?}", 
-                self.shape, other.shape
-            ));
+        if self.shape.len() != 2 {
+            return Err(OxideError::InvalidDimension { axis: 2, shape: self.shape.clone() });
+        }
+        if other.shape.len() != 2 {
+            return Err(OxideError::InvalidDimension { axis: 2, shape: other.shape.clone() });
         }
         
         // 2. Verify Inner Dimension Compatibility (K == K)
         if self.shape[1] != other.shape[0] {
-            return Err(format!(
+            return Err(OxideError::MathError(format!(
                 "Matmul inner dimensions mismatch: {} (cols of A) != {} (rows of B)", 
                 self.shape[1], other.shape[0]
-            ));
+            )));
         }
     
         // 3. Dispatch to Hardware safely
-        let out_data = B::matmul(&self.device, &self.data, &self.shape, &other.data, &other.shape)?;
+        let out_data = B::matmul(&self.device, &self.data, &self.shape, &other.data, &other.shape)
+            .map_err(OxideError::GpuError)?;
         
         Ok(Self { 
             data: out_data, 
@@ -87,8 +101,9 @@ impl<B: Backend> Tensor<B> {
         })
     }
 
-    pub fn transpose(&self) -> Result<Self, String> {
-        let out_data = B::transpose(&self.device, &self.data, &self.shape)?;
+    pub fn transpose(&self) -> Result<Self> {
+        let out_data = B::transpose(&self.device, &self.data, &self.shape)
+            .map_err(OxideError::GpuError)?;
         Ok(Self { data: out_data, shape: vec![self.shape[1], self.shape[0]], device: self.device.clone() })
     }
 
@@ -97,11 +112,15 @@ impl<B: Backend> Tensor<B> {
         Self { data: out_data, shape: self.shape.clone(), device: self.device.clone() }
     }
 
-    pub fn mse_loss(&self, target: &Tensor<B>) -> Result<Self, String> {
+    pub fn mse_loss(&self, target: &Tensor<B>) -> Result<Self> {
         if self.shape != target.shape {
-            return Err(format!("Shape mismatch in mse_loss: target {:?} != pred {:?}", target.shape, self.shape));
+            return Err(OxideError::ShapeMismatch {
+                expected: target.shape.clone(),
+                actual: self.shape.clone(),
+            });
         }
-        let out_data = B::mse_loss(&self.device, &self.data, &target.data, &self.shape)?;
+        let out_data = B::mse_loss(&self.device, &self.data, &target.data, &self.shape)
+            .map_err(OxideError::GpuError)?;
         Ok(Self { data: out_data, shape: vec![1], device: self.device.clone() })
     }
 
@@ -128,11 +147,15 @@ impl<B: Backend> Tensor<B> {
         Self { data: out_data, shape: self.shape.clone(), device: self.device.clone() }
     }
 
-    pub fn mul_elementwise(&self, other: &Tensor<B>) -> Result<Self, String> {
+    pub fn mul_elementwise(&self, other: &Tensor<B>) -> Result<Self> {
         if self.shape != other.shape {
-            return Err(format!("Shape mismatch in mul_elementwise: {:?} != {:?}", self.shape, other.shape));
+            return Err(OxideError::ShapeMismatch {
+                expected: self.shape.clone(),
+                actual: other.shape.clone(),
+            });
         }
-        let out_data = B::mul_elementwise(&self.device, &self.data, &other.data, &self.shape, &other.shape)?;
+        let out_data = B::mul_elementwise(&self.device, &self.data, &other.data, &self.shape, &other.shape)
+            .map_err(OxideError::GpuError)?;
         Ok(Self { data: out_data, shape: self.shape.clone(), device: self.device.clone() })
     }
 
@@ -141,56 +164,50 @@ impl<B: Backend> Tensor<B> {
         Self { data: out_data, shape: self.shape.clone(), device: self.device.clone() }
     }
 
-    pub fn conv2d(&self, weight: &Tensor<B>, bias: &Tensor<B>, stride: usize, padding: usize) -> Result<Self, String> {
-        // 1. Verify 4D Ranks
-        if self.shape.len() != 4 || weight.shape.len() != 4 {
-            return Err(format!(
-                "Conv2d requires 4D tensors, but got input {:?} and weight {:?}", 
-                self.shape, weight.shape
-            ));
+    pub fn conv2d(&self, weight: &Tensor<B>, bias: &Tensor<B>, stride: usize, padding: usize) -> Result<Self> {
+        if self.shape.len() != 4 {
+            return Err(OxideError::InvalidDimension { axis: 4, shape: self.shape.clone() });
+        }
+        if weight.shape.len() != 4 {
+            return Err(OxideError::InvalidDimension { axis: 4, shape: weight.shape.clone() });
         }
     
         let (in_c, h, w_dim) = (self.shape[1], self.shape[2], self.shape[3]);
         let (out_c, w_in_c, kh, kw) = (weight.shape[0], weight.shape[1], weight.shape[2], weight.shape[3]);
     
-        // 2. Verify Channel Consistency
         if in_c != w_in_c {
-            return Err(format!(
+            return Err(OxideError::MathError(format!(
                 "Conv2d channel mismatch: input has {} channels, but weight expects {}", 
                 in_c, w_in_c
-            ));
+            )));
         }
     
-        // 3. Verify Bias Shape
         if bias.shape.len() != 1 || bias.shape[0] != out_c {
-            return Err(format!(
+            return Err(OxideError::MathError(format!(
                 "Conv2d bias mismatch: expected shape [{}], but got {:?}", 
                 out_c, bias.shape
-            ));
+            )));
         }
     
-        // 4. Prevent Divide-by-Zero
         if stride == 0 {
-            return Err("Conv2d stride cannot be zero".to_string());
+            return Err(OxideError::MathError("Conv2d stride cannot be zero".to_string()));
         }
     
-        // 5. Prevent usize Underflow (Kernel must fit inside padded input)
         let padded_h = h + 2 * padding;
         let padded_w = w_dim + 2 * padding;
         if kh > padded_h || kw > padded_w {
-            return Err(format!(
+            return Err(OxideError::MathError(format!(
                 "Conv2d kernel size ({}x{}) is larger than padded input ({}x{})", 
                 kh, kw, padded_h, padded_w
-            ));
+            )));
         }
     
-        // 6. Safe Dispatch
         let (out_data, out_shape) = B::conv2d(
             &self.device, &self.data, &self.shape,
             &weight.data, &weight.shape,
             &bias.data, &bias.shape,
             stride, padding
-        )?;
+        ).map_err(OxideError::GpuError)?;
         
         Ok(Self { data: out_data, shape: out_shape, device: self.device.clone() })
     }
@@ -209,8 +226,9 @@ impl<B: Backend> Tensor<B> {
         )
     }
 
-    pub fn maxpool2d(&self, kernel_size: usize) -> Result<Self, String> {
-        let (out_data, out_shape) = B::maxpool2d(&self.device, &self.data, &self.shape, kernel_size)?;
+    pub fn maxpool2d(&self, kernel_size: usize) -> Result<Self> {
+        let (out_data, out_shape) = B::maxpool2d(&self.device, &self.data, &self.shape, kernel_size)
+            .map_err(OxideError::GpuError)?;
         Ok(Self { data: out_data, shape: out_shape, device: self.device.clone() })
     }
 
@@ -228,15 +246,15 @@ impl<B: Backend> Tensor<B> {
         is_training: bool,
         momentum: f64,
         eps: f64,
-    ) -> Result<Self, String> {
+    ) -> Result<Self> {
         if self.shape.len() != 4 {
-            return Err(format!("BatchNorm2d requires 4D tensor [N, C, H, W], got {:?}", self.shape));
+            return Err(OxideError::InvalidDimension { axis: 4, shape: self.shape.clone() });
         }
         if weight.shape.len() != 1 || weight.shape[0] != self.shape[1] {
-            return Err(format!("BatchNorm2d weight shape mismatch: expected [{}], got {:?}", self.shape[1], weight.shape));
+            return Err(OxideError::MathError(format!("BatchNorm2d weight shape mismatch: expected [{}], got {:?}", self.shape[1], weight.shape)));
         }
         if bias.shape.len() != 1 || bias.shape[0] != self.shape[1] {
-            return Err(format!("BatchNorm2d bias shape mismatch: expected [{}], got {:?}", self.shape[1], bias.shape));
+            return Err(OxideError::MathError(format!("BatchNorm2d bias shape mismatch: expected [{}], got {:?}", self.shape[1], bias.shape)));
         }
 
         let out_data = B::batch_norm2d(
@@ -250,7 +268,7 @@ impl<B: Backend> Tensor<B> {
             is_training,
             momentum,
             eps,
-        )?;
+        ).map_err(OxideError::GpuError)?;
 
         Ok(Self {
             data: out_data,
@@ -274,11 +292,30 @@ impl<B: Backend> Tensor<B> {
             Tensor { data: grad_b, shape: weight.shape.clone(), device: self.device.clone() }
         )
     }
+
+    pub fn apply_alive_mask_clamp(&self, alpha_idx: usize, loss: &Tensor<B>, seed: &Tensor<B>, do_clamp: bool) -> Result<Self> {
+        // Pass the boolean down to the hardware backend
+        let out_data = B::apply_alive_mask_clamp(&self.device, &self.data, &self.shape, alpha_idx, &loss.data, &seed.data, do_clamp);
+        Ok(Self { 
+            data: out_data, 
+            shape: self.shape.clone(), 
+            device: self.device.clone() 
+        })
+    }
+
+    pub fn cellular_mask(device: B, shape: &[usize], drop_prob: f64, seed: u32) -> Result<Self> {
+        let data = B::generate_cellular_mask(&device, shape, drop_prob as f32, seed);
+        Ok(Self { 
+            data, 
+            shape: shape.to_vec(), 
+            device 
+        })
+    }
+    
 }
 
 impl<B: Backend> fmt::Display for Tensor<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // 🎯 We require backends to provide a way to sync data to CPU RAM for debugging
         let cpu_data = B::to_cpu(&self.device, &self.data);
         
         writeln!(f, "Tensor(shape: {:?}) [", self.shape)?;

@@ -733,3 +733,110 @@ fn batch_norm2d_backward(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
 }
+
+struct AliveMaskDims {
+    channels: u32,
+    h: u32,
+    w: u32,
+    alpha_idx: u32,
+    do_clamp: u32,
+}
+
+@group(0) @binding(0) var<storage, read> am_in: array<f32>;
+@group(0) @binding(1) var<storage, read_write> am_out: array<f32>;
+@group(0) @binding(2) var<uniform> am_dims: AliveMaskDims;
+@group(0) @binding(3) var<storage, read> loss_val: array<f32>;
+@group(0) @binding(4) var<storage, read> seed_in: array<f32>;
+
+@compute @workgroup_size(64)
+fn alive_mask_clamp(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let idx = global_id.x;
+    let total_pixels = am_dims.h * am_dims.w;
+
+    if (idx < total_pixels) {
+        let current_loss = loss_val[0];
+        if (!(current_loss <= 20.0)) {
+            for (var c: u32 = 0u; c < am_dims.channels; c = c + 1u) {
+                let cell_idx = c * total_pixels + idx;
+                am_out[cell_idx] = seed_in[cell_idx];
+            }
+            return; 
+        }
+
+        let x = idx % am_dims.w;
+        let y = idx / am_dims.w;
+
+        var neighbor_alive = false;
+        for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+            for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+                let ny = i32(y) + dy;
+                let nx = i32(x) + dx;
+
+                if (ny >= 0 && ny < i32(am_dims.h) && nx >= 0 && nx < i32(am_dims.w)) {
+                    let n_idx = am_dims.alpha_idx * total_pixels + u32(ny) * am_dims.w + u32(nx);
+                    if (am_in[n_idx] > 0.1) {
+                        neighbor_alive = true;
+                    }
+                }
+            }
+        }
+
+        for (var c: u32 = 0u; c < am_dims.channels; c = c + 1u) {
+            let cell_idx = c * total_pixels + y * am_dims.w + x;
+            if (!neighbor_alive) {
+                am_out[cell_idx] = 0.0;
+            } else {
+                // DYNAMIC CLAMPING: Only clamp if the CPU requested it!
+                if (am_dims.do_clamp == 1u) {
+                    am_out[cell_idx] = clamp(am_in[cell_idx], -1.5, 1.5);
+                } else {
+                    am_out[cell_idx] = am_in[cell_idx];
+                }
+            }
+        }
+    }
+}
+
+struct CellMaskDims {
+    channels: u32,
+    h: u32,
+    w: u32,
+    seed: u32,
+    drop_prob: f32,
+}
+
+@group(0) @binding(0) var<storage, read_write> mask_out: array<f32>;
+@group(0) @binding(1) var<uniform> m_dims: CellMaskDims;
+
+// ⚡ Standard Pseudo-Random Number Generator
+fn pcg_hash(input: u32) -> u32 {
+    var state = input * 747796405u + 2891336453u;
+    var word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+@compute @workgroup_size(64)
+fn generate_cellular_mask(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let idx = global_id.x;
+    let total_size = m_dims.channels * m_dims.h * m_dims.w;
+    
+    // Bounds check based on the flat tensor size
+    if (idx >= total_size) {
+        return;
+    }
+
+    // 1. Standard ML Dropout: Randomize per individual element
+    let rng_state = pcg_hash(idx + m_dims.seed);
+    let rand_val = f32(rng_state) / f32(0xFFFFFFFFu);
+
+    var keep = 1.0;
+    if (rand_val < m_dims.drop_prob) {
+        keep = 0.0;
+    }
+
+    // 2. Standard ML Scaling: Boost surviving numbers to maintain signal strength
+    let scale = 1.0 / (1.0 - m_dims.drop_prob);
+    let mask_val = keep * scale;
+
+    mask_out[idx] = mask_val; 
+}

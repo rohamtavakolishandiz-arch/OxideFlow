@@ -65,6 +65,14 @@ struct BatchNormDims {
     eps: f32, momentum: f32, is_training: u32, _pad: u32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct AliveMaskDims { channels: u32, h: u32, w: u32, alpha_idx: u32, do_clamp: u32 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct CellMaskDims { channels: u32, h: u32, w: u32, seed: u32, drop_prob: f32 }
+
 // ==========================================
 // BACKEND TRAIT
 // ==========================================
@@ -97,7 +105,7 @@ pub trait Backend: Clone + 'static {
     fn maxpool2d(device: &Self, a: &Self::Buffer, shape: &[usize], kernel_size: usize) -> Result<(Self::Buffer, Vec<usize>), String>;
     fn maxpool2d_backward(device: &Self, a: &Self::Buffer, shape: &[usize], grad_out: &Self::Buffer, shape_go: &[usize], kernel_size: usize) -> Self::Buffer;
 
-    // 🎯 The New Optimizer Route
+    // The New Optimizer Route
     fn adamw_step(device: &Self, weight: &mut Self::Buffer, grad: &Self::Buffer, m: &mut Self::Buffer, v: &mut Self::Buffer, config: &AdamWConfig);
 
     fn batch_norm2d(
@@ -111,6 +119,10 @@ pub trait Backend: Clone + 'static {
         device: &Self, input: &Self::Buffer, shape: &[usize],
         grad_out: &Self::Buffer, weight: &Self::Buffer, eps: f64
     ) -> (Self::Buffer, Self::Buffer, Self::Buffer);
+
+    fn apply_alive_mask_clamp(device: &Self, a: &Self::Buffer, shape: &[usize], alpha_idx: usize, loss: &Self::Buffer, seed: &Self::Buffer, do_clamp: bool) -> Self::Buffer;
+
+    fn generate_cellular_mask(device: &Self, shape: &[usize], drop_prob: f32, seed: u32) -> Self::Buffer;
 
     fn to_cpu(device: &Self, buffer: &Self::Buffer) -> Vec<f64>;
 }
@@ -335,6 +347,10 @@ impl Backend for CpuBackend {
         unimplemented!("BatchNorm2d for CpuBackend is not implemented yet")
     }
 
+    fn apply_alive_mask_clamp(_d: &Self, _a: &Self::Buffer, _s: &[usize], _alpha: usize, _loss: &Self::Buffer, _seed: &Self::Buffer, _dc: bool) -> Self::Buffer { unimplemented!() }
+
+    fn generate_cellular_mask(_d: &Self, _s: &[usize], _p: f32, _seed: u32) -> Self::Buffer { unimplemented!() }
+
     fn batch_norm2d_backward(
         _d: &Self, _i: &Self::Buffer, _s: &[usize], _go: &Self::Buffer, _w: &Self::Buffer, _eps: f64
     ) -> (Self::Buffer, Self::Buffer, Self::Buffer) {
@@ -348,7 +364,7 @@ impl Backend for CpuBackend {
 // WGPU BACKEND (GPU)
 // ==========================================
 
-// 🎯 The Buffer Pool: Maps a requested byte size to a list of free, reusable VRAM buffers
+// The Buffer Pool: Maps a requested byte size to a list of free, reusable VRAM buffers
 pub type BufferPool = Arc<RwLock<HashMap<wgpu::BufferAddress, Vec<Arc<wgpu::Buffer>>>>>;
 
 #[derive(Clone, Debug)]
@@ -366,7 +382,7 @@ pub struct WgpuBuffer {
     pub pool: BufferPool, // <-- NEW: Buffers carry a reference to their pool
 }
 
-// 🎯 THE MAGIC: When a tensor is dropped, intercept it!
+// THE MAGIC: When a tensor is dropped, intercept it!
 impl Drop for WgpuBuffer {
     fn drop(&mut self) {
         // If this is the last reference to this specific buffer...
@@ -388,14 +404,16 @@ impl WgpuBackend {
             let instance = wgpu::Instance::default();
             
             // Create the surface from the winit window
-            let surface = instance.create_surface(window.clone()).unwrap();
+            let surface = instance.create_surface(window.clone())
+                .expect("Fatal GPU Error: Failed to create Window Surface.");
             
             let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
                 compatible_surface: Some(&surface),
                 ..Default::default()
-            }).await.unwrap();
+            }).await.expect("Fatal GPU Error: Failed to find a compatible graphics adapter.");
             
-            let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default()).await.unwrap();
+            let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default()).await
+                .expect("Fatal GPU Error: Failed to request logical GPU device.");
             
             let size = window.inner_size();
             let caps = surface.get_capabilities(&adapter);
@@ -426,7 +444,7 @@ impl WgpuBackend {
         
         (backend, surface, config)
     }
-    // 🎯 Fast VRAM Allocator
+    // Fast VRAM Allocator
     fn allocate(&self, size: wgpu::BufferAddress) -> Arc<wgpu::Buffer> {
         // 1. Check if we have a recycled buffer of the exact size
         if let Ok(mut pool) = self.pool.write() {
@@ -447,7 +465,7 @@ impl WgpuBackend {
     }
 
     fn get_pipeline(&self, entry_point: &'static str) -> Arc<wgpu::ComputePipeline> {
-        if let Some(pipe) = self.pipelines.read().unwrap().get(entry_point) {
+        if let Some(pipe) = self.pipelines.read().expect("Thread Error: Pipeline lock poisoned.").get(entry_point) {
             return pipe.clone();
         }
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -457,7 +475,7 @@ impl WgpuBackend {
         let pipe = Arc::new(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(entry_point), layout: None, module: &shader, entry_point: Some(entry_point), compilation_options: Default::default(), cache: None,
         }));
-        self.pipelines.write().unwrap().insert(entry_point, pipe.clone());
+        self.pipelines.write().expect("Thread Error: Pipeline lock poisoned.").insert(entry_point, pipe.clone());
         pipe
     }
 
@@ -523,8 +541,10 @@ impl Backend for WgpuBackend {
     fn new() -> Self {
         let (device, queue) = pollster::block_on(async {
             let instance = wgpu::Instance::default();
-            let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions::default()).await.unwrap();
-            adapter.request_device(&wgpu::DeviceDescriptor::default()).await.unwrap()
+            let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions::default()).await
+                .expect("Fatal GPU Error: Failed to find adapter in headless mode.");
+            adapter.request_device(&wgpu::DeviceDescriptor::default()).await
+                .expect("Fatal GPU Error: Failed to request device in headless mode.")
         });
         Self { 
             device: Arc::new(device), 
@@ -538,10 +558,10 @@ impl Backend for WgpuBackend {
         let data_f32: Vec<f32> = data.into_iter().map(|x| x as f32).collect();
         let size = (data_f32.len() * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
         
-        // 🎯 Allocate from pool
+        // Allocate from pool
         let buffer = device.allocate(size);
         
-        // 🎯 Write data rapidly over the queue
+        // Write data rapidly over the queue
         device.queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&data_f32));
         
         WgpuBuffer { buffer, length: data_f32.len(), pool: device.pool.clone() }
@@ -551,10 +571,10 @@ impl Backend for WgpuBackend {
         let len: usize = shape.iter().product();
         let size = (len * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
         
-        // 🎯 Allocate from pool
+        // Allocate from pool
         let buffer = device.allocate(size);
 
-        // 🎯 Fast hardware-level memory clear (overwrites garbage from recycled buffers)
+        // Fast hardware-level memory clear (overwrites garbage from recycled buffers)
         let mut encoder = device.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         encoder.clear_buffer(&buffer, 0, None);
         device.queue.submit(Some(encoder.finish()));
@@ -578,11 +598,21 @@ impl Backend for WgpuBackend {
 
         let buffer_slice = staging_buffer.slice(..);
         let (sender, receiver) = std::sync::mpsc::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
-        device.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        receiver.recv().unwrap().unwrap();
+        
+        buffer_slice.map_async(wgpu::MapMode::Read, move |v| {
+            sender.send(v).expect("Fatal GPU Error: Failed to send VRAM mapping result across thread.");
+        });
+        
+        device.device.poll(wgpu::PollType::wait_indefinitely())
+            .expect("Fatal GPU Error: Device poll failed during VRAM extraction.");
+            
+        receiver.recv()
+            .expect("Fatal GPU Error: Mapping channel disconnected.")
+            .expect("Fatal GPU Error: Failed to map VRAM buffer to CPU.");
 
-        let data_result = buffer_slice.get_mapped_range().unwrap();
+        // Some wgpu versions return a direct view, others return a Result. expect() handles the Result if present.
+        let data_result = buffer_slice.get_mapped_range()
+            .expect("Fatal GPU Error: Failed to extract mapped memory range from VRAM."); 
         let result_f32: &[f32] = bytemuck::cast_slice(&data_result);
         result_f32.iter().map(|&x| x as f64).collect()
     }
@@ -669,7 +699,7 @@ impl Backend for WgpuBackend {
         }
         device.queue.submit(Some(encoder.finish()));
         
-        // 🎯 We only pull 4 bytes (1 float) back across the PCIe bus!
+        // We only pull 4 bytes (1 float) back across the PCIe bus!
         Self::to_cpu(device, &out_buffer)[0]
     }
 
@@ -700,7 +730,7 @@ impl Backend for WgpuBackend {
         }
         device.queue.submit(Some(encoder.finish()));
         
-        // 🎯 We only pull 4 bytes (1 float) back across the PCIe bus!
+        // We only pull 4 bytes (1 float) back across the PCIe bus!
         Self::to_cpu(device, &out_buffer)[0]
     }
 
@@ -1057,6 +1087,77 @@ impl Backend for WgpuBackend {
         device.queue.submit(Some(encoder.finish()));
         
         (grad_in, grad_w, grad_b)
+    }
+
+    fn apply_alive_mask_clamp(
+        device: &Self, a: &Self::Buffer, shape: &[usize], alpha_idx: usize, loss: &Self::Buffer, seed: &Self::Buffer, do_clamp: bool
+    ) -> Self::Buffer {
+        let (c, h, w) = (shape[1], shape[2], shape[3]);
+        let dims = AliveMaskDims { 
+            channels: c as u32, 
+            h: h as u32, 
+            w: w as u32, 
+            alpha_idx: alpha_idx as u32,
+            do_clamp: if do_clamp { 1 } else { 0 } // 🛡️ Converts Rust bool to WGSL u32
+        };
+        
+        let out_buffer = Self::zeros(device, shape);
+        let compute_pipeline = device.get_pipeline("alive_mask_clamp");
+    
+        let dims_buffer = device.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Alive Dims"), contents: bytemuck::cast_slice(&[dims]), usage: wgpu::BufferUsages::UNIFORM,
+        });
+    
+        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &compute_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: a.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: out_buffer.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dims_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: loss.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: seed.buffer.as_entire_binding() },
+            ],
+        });
+    
+        let mut encoder = device.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            cpass.set_pipeline(&compute_pipeline); cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.dispatch_workgroups((((h * w) as u32) + 63) / 64, 1, 1);
+        }
+        device.queue.submit(Some(encoder.finish()));
+        out_buffer
+    }
+
+    fn generate_cellular_mask(device: &Self, shape: &[usize], drop_prob: f32, seed: u32) -> Self::Buffer {
+        let (c, h, w) = (shape[1], shape[2], shape[3]);
+        let dims = CellMaskDims { 
+            channels: c as u32, h: h as u32, w: w as u32, seed, drop_prob 
+        };
+        
+        let out_buffer = Self::zeros(device, shape);
+        let compute_pipeline = device.get_pipeline("generate_cellular_mask");
+    
+        let dims_buffer = device.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("CellMask Dims"), contents: bytemuck::cast_slice(&[dims]), usage: wgpu::BufferUsages::UNIFORM,
+        });
+    
+        let bind_group = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &compute_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: out_buffer.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: dims_buffer.as_entire_binding() },
+            ],
+        });
+    
+        let mut encoder = device.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            cpass.set_pipeline(&compute_pipeline); cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.dispatch_workgroups((((h * w) as u32) + 63) / 64, 1, 1);
+        }
+        device.queue.submit(Some(encoder.finish()));
+        out_buffer
     }
     
 }

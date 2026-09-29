@@ -1,0 +1,13 @@
+[network]
+input_size = 5
+hidden_size = 64
+output_size = 2
+
+[hyperparams]
+learning_rate = 0.001
+gamma = 0.99
+batch_size = 64
+memory_capacity = 10000
+epsilon_start = 1.0
+epsilon_min = 0.05
+epsilon_decay = 0.995
