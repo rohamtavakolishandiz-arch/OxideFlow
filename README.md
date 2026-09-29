@@ -71,3 +71,18 @@ impl Environment for MyCustomGame {
     fn score(&self) -> u32 { ... }
 }
 Swap out the environment in main.rs, update your config.toml sizes, and let the engine solve your custom game!
+
+## ⚡ Fuel the Engine
+
+OxideFlow is 100% open-source and free to use. Building a custom hardware-accelerated autograd engine, trait-based environments, and a real-time cyberpunk rendering suite from scratch in Rust takes countless late-night coding sessions and copious amounts of caffeine. 
+
+If this framework helped you train your own AI, saved you hours of debugging Python wrappers, or you simply believe in supporting high-performance Rust tools, consider dropping a crypto tip. 
+
+*Your support directly fuels my compute cycles, hardware testing, and the next major feature update.*
+
+** Drop a Crypto Coffee:**
+* **Solana (SOL):** `E86tzDPwHYGuDNCSHEaaJzwmvb2ik4L8qnCULK9yuAQQ`
+
+> **Note:** Make sure to double-check the network (like TRC20 for USDT) before sending!
+
+*Not into crypto? No problem. Simply starring the repository ⭐ and sharing OxideFlow with other developers is a massive help and hugely appreciated!*
